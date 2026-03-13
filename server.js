@@ -1,4 +1,3 @@
-
 // server.js
 // T.U.S.L. Live Sports Data API
 // The Ultimate Sports League — MLB | NFL | NBA | NHL
