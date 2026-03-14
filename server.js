@@ -12,7 +12,7 @@ const caches = {
   live:      new NodeCache({ stdTTL: 20 }),
   standings: new NodeCache({ stdTTL: 300 }),
   teams:     new NodeCache({ stdTTL: 86400 }),
-  stats:     new NodeCache({ stdTTL: 60 }),  // 60s — keeps stats fresh
+  stats:     new NodeCache({ stdTTL: 300 }),
   search:    new NodeCache({ stdTTL: 604800 }),
 };
 
@@ -301,6 +301,28 @@ app.get("/api/sports/:sport/athletes/:id/stats", async (req,res) => {
     console.error("Stats route error:", err.message);
     res.json(empty);
   }
+});
+
+
+// Debug — shows raw ESPN response for a player (temp diagnostic)
+app.get("/api/debug/:sport/:id", async (req,res) => {
+  const {sport,id}=req.params;
+  if (!SPORTS[sport]) return res.status(400).json({ error:"Invalid sport" });
+  const {sport:s,league:l}=SPORTS[sport];
+  try {
+    const url=`${ESPN}/${s}/${l}/athletes/${id}/statistics`;
+    const {data}=await espnClient.get(url);
+    res.json({
+      url,
+      hasAthlete: !!data.athlete,
+      athleteName: data.athlete?.fullName,
+      statisticsCount: (data.statistics||[]).length,
+      statisticsNames: (data.statistics||[]).map(g=>g.name),
+      firstGroupNames: (data.statistics?.[0]?.names||[]).slice(0,10),
+      firstGroupStats: (data.statistics?.[0]?.stats||[]).slice(0,10),
+      hasSplitCategories: !!(data.splitCategories?.length),
+    });
+  } catch(err) { res.json({ error:err.message, url:`${ESPN}/${s}/${l}/athletes/${id}/statistics` }); }
 });
 
 app.use((req,res)=>res.status(404).json({ error:"Not found" }));
