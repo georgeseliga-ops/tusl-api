@@ -120,7 +120,6 @@ async function searchAthlete(sport, name) {
 
 async function getAthleteStats(sport, athleteId) {
   const {sport:s,league:l}=SPORTS[sport];
-  // Try season years 2026 then 2025 — ESPN is inconsistent
   const years=["2026","2025"];
   let data=null;
   for(const yr of years){
@@ -217,6 +216,7 @@ app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
   }
 });
 
+// Debug: look up player by name and get their correct ESPN ID + stats
 app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
@@ -238,6 +238,16 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
     }catch(e){continue;}
   }
   res.json({error:"both years failed",sport,id});
+});
+
+// Find correct ESPN ID by searching rosters
+app.get("/api/findplayer/:sport/:name",async(req,res)=>{
+  const{sport,name}=req.params;
+  if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
+  try{
+    const result=await searchAthlete(sport,decodeURIComponent(name));
+    res.json(result);
+  }catch(err){res.json({error:err.message});}
 });
 
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
