@@ -146,81 +146,72 @@ async function searchAthlete(sport, name) {
 // ── Athlete stats ──────────────────────────────────────────────────────────
 async function getAthleteStats(sport, athleteId) {
   const {sport:s,league:l} = SPORTS[sport];
-  // seasontype=2 = regular season, no year = ESPN picks current active season
-  const urls = [
+  
+  // ESPN endpoint formats vary by sport — try multiple
+  const urlsToTry = [
+    `https://sports.core.api.espn.com/v2/sports/${s}/leagues/${l}/athletes/${athleteId}/statistics`,
     `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?seasontype=2`,
     `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`,
   ];
 
   let data = null;
-  for (const url of urls) {
+  for (const url of urlsToTry) {
     try {
       const resp = await espnClient.get(url);
-      data = resp.data;
-      if (data && (data.statistics || data.athlete)) break; // got valid data
-    } catch(e) {
-      // 404 or ESPN error — try next URL
-      continue;
-    }
+      if (resp.data && Object.keys(resp.data).length > 1) {
+        data = resp.data;
+        break;
+      }
+    } catch(e) { continue; }
   }
 
-  // If we couldn't get anything, return empty gracefully
-  if (!data) {
-    return { athleteId, stats: {}, rawGroups: [], error: "ESPN stats unavailable" };
-  }
+  if (!data) return { athleteId, stats:{}, rawGroups:[], error:"ESPN stats unavailable" };
 
   const athlete = data.athlete || {};
   let flat = {};
-
-  // Parse statistics array — prefer Regular Season group
-  const statGroups = data.statistics || [];
   
-  // First pass: look for explicit regular season group
-  const regGroup = statGroups.find(g => /regular\s*season/i.test(g.name || ""));
+  // Handle core API format (has "splits" instead of "statistics")
+  const splits = data.splits?.categories || [];
+  if (splits.length > 0) {
+    splits.forEach(cat => {
+      (cat.stats || []).forEach(stat => {
+        if (stat.name && stat.value !== undefined) flat[stat.name] = parseFloat(stat.value) || 0;
+        if (stat.abbreviation && stat.value !== undefined) flat[stat.abbreviation] = parseFloat(stat.value) || 0;
+      });
+    });
+  }
+
+  // Handle site API format (has "statistics" array)
+  const statGroups = data.statistics || [];
+  const regGroup = statGroups.find(g => /regular/i.test(g.name || "")) || statGroups.find(g => !/(playoff|post)/i.test(g.name || ""));
   if (regGroup) {
     const names = regGroup.names || regGroup.labels || [];
     const stats = regGroup.stats || regGroup.values || [];
     names.forEach((n, i) => { if (n) flat[n] = parseFloat(stats[i]) || 0; });
-  } else {
-    // Second pass: use all non-playoff groups
-    statGroups.forEach(group => {
-      if (/(playoff|post)/i.test(group.name || "")) return;
-      const names = group.names || group.labels || [];
-      const stats = group.stats || group.values || [];
-      names.forEach((n, i) => { if (n && flat[n] === undefined) flat[n] = parseFloat(stats[i]) || 0; });
-    });
   }
 
-  // Also try splitCategories format
-  try {
-    (data.splitCategories || []).forEach(cat => {
-      (cat.splits || []).forEach(split => {
-        if (/total|season|regular/i.test(split.abbreviation || split.displayName || "")) {
-          const names = cat.names || cat.abbreviations || [];
-          (split.stats || []).forEach((val, i) => {
-            const n = names[i];
-            if (n && flat[n] === undefined) flat[n] = parseFloat(val) || 0;
-          });
-        }
-      });
+  // Handle categories format
+  (data.categories || []).forEach(cat => {
+    (cat.stats || cat.values || []).forEach((stat, i) => {
+      const name = typeof stat === 'object' ? stat.name : (cat.names || [])[i];
+      const val = typeof stat === 'object' ? stat.value : stat;
+      if (name) flat[name] = parseFloat(val) || 0;
     });
-  } catch(e) {}
+  });
 
   return {
     athleteId,
-    name: athlete.fullName || athlete.displayName || null,
-    position: athlete.position?.abbreviation || null,
-    team: athlete.team?.abbreviation || null,
+    name: athlete.fullName || athlete.displayName || data.displayName || null,
     stats: flat,
-    rawGroups: statGroups.map(g => ({
+    rawGroups: statGroups.slice(0,3).map(g => ({
       name: g.name || "",
-      names: (g.names || g.labels || []).slice(0, 30),
-      stats: (g.stats || g.values || []).slice(0, 30)
+      names: (g.names || g.labels || []).slice(0, 15),
+      stats: (g.stats || g.values || []).slice(0, 15)
     }))
   };
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────
+
 app.get("/", (req,res) => res.json({ name:"T.U.S.L. API v3", sports:["mlb","nfl","nba","nhl"] }));
 app.get("/health", (req,res) => res.json({ status:"ok", uptime:`${Math.floor(process.uptime())}s` }));
 
@@ -327,3 +318,4 @@ app.get("/api/debug/:sport/:id", async (req,res) => {
 
 app.use((req,res)=>res.status(404).json({ error:"Not found" }));
 app.listen(PORT,()=>console.log(`\n🏆 T.U.S.L. API v3 running on port ${PORT}\n`));
+
