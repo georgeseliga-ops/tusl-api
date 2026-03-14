@@ -216,4 +216,78 @@ app.get("/api/dashboard", async (req,res) => {
       if (r.status==="fulfilled") {
         const games = r.value.data.games||[];
         sports[sport] = { totalGames:games.length, liveGames:games.filter(g=>g.isLive).length,
-          games:games.map(g=>({ id:g.id, shortName:g.shortName, status:g.status, isLive:g.isLive,
+          games:games.map(g=>({ id:g.id, shortName:g.shortName, status:g.status, isLive:g.isLive, score:g.competitors.map(c=>`${c.team} ${c.score}`).join(" - "), broadcast:g.broadcast })) };
+      } else { sports[sport]={ error:r.reason?.message }; }
+    });
+    res.json({ lastUpdated:new Date().toISOString(), sports });
+  } catch(err) { res.status(500).json({ error:err.message }); }
+});
+
+app.get("/api/sports/:sport/scoreboard", async (req,res) => {
+  const {sport}=req.params;
+  if (!SPORTS[sport]) return res.status(400).json({ error:"Invalid sport" });
+  try {
+    if (req.query.refresh==="true") caches.live.del(`sb_${sport}`);
+    const {data,fromCache}=await getOrFetch("live",`sb_${sport}`,()=>getScoreboard(sport));
+    res.json({...data,fromCache});
+  } catch(err) { res.status(500).json({ error:err.message }); }
+});
+
+app.get("/api/sports/:sport/standings", async (req,res) => {
+  const {sport}=req.params;
+  if (!SPORTS[sport]) return res.status(400).json({ error:"Invalid sport" });
+  try {
+    const {data,fromCache}=await getOrFetch("standings",`st_${sport}`,()=>getStandings(sport));
+    res.json({...data,fromCache});
+  } catch(err) { res.status(500).json({ error:err.message }); }
+});
+
+app.get("/api/sports/:sport/teams", async (req,res) => {
+  const {sport}=req.params;
+  if (!SPORTS[sport]) return res.status(400).json({ error:"Invalid sport" });
+  try {
+    const {data,fromCache}=await getOrFetch("teams",`tm_${sport}`,()=>getTeams(sport));
+    res.json({...data,fromCache});
+  } catch(err) { res.status(500).json({ error:err.message }); }
+});
+
+app.get("/api/sports/:sport/athletes/search", async (req,res) => {
+  const {sport}=req.params;
+  const {name}=req.query;
+  if (!SPORTS[sport]) return res.status(400).json({ error:"Invalid sport" });
+  if (!name) return res.status(400).json({ error:"?name= required" });
+  try {
+    const cacheKey=`search_${sport}_${name.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}`;
+    const {data}=await getOrFetch("search",cacheKey,()=>searchAthlete(sport,name));
+    res.json(data);
+  } catch(err) { res.status(500).json({ error:err.message }); }
+});
+
+app.get("/api/sports/:sport/athletes/:id/stats", async (req,res) => {
+  const {sport,id}=req.params;
+  const {season}=req.query;
+  if (!SPORTS[sport]) return res.status(400).json({ error:"Invalid sport" });
+  const empty = { athleteId:id, stats:{}, rawGroups:[], fromCache:false };
+  try {
+    const cacheKey=`stats_${sport}_${id}_${season||"cur"}`;
+    const cached = caches.stats.get(cacheKey);
+    if (cached !== undefined) return res.json({...cached, fromCache:true});
+    let result = empty;
+    try {
+      result = await getAthleteStats(sport, id, season);
+      if (result && Object.keys(result.stats||{}).length > 0) caches.stats.set(cacheKey, result);
+    } catch(e) { console.error("Stats ESPN error "+sport+"/"+id+":", e.message); }
+    res.json({...result, fromCache:false});
+  } catch(err) {
+    console.error("Stats route error:", err.message);
+    res.json(empty);
+  }
+});
+
+app.use((req,res)=>res.status(404).json({ error:"Not found" }));
+app.listen(PORT,()=>console.log(`\n🏆 T.U.S.L. API v3 running on port ${PORT}\n`));
+```
+
+Paste that in, commit, and Railway will redeploy. Once it's active, open this URL in your browser to test one player directly:
+```
+https://tusl-api-production.up.railway.app/api/sports/nhl/athletes/3042140/stats
