@@ -146,8 +146,11 @@ async function searchAthlete(sport, name) {
 // ── Athlete stats ──────────────────────────────────────────────────────────
 async function getAthleteStats(sport, athleteId) {
   const {sport:s,league:l} = SPORTS[sport];
-  // No season param — ESPN defaults to current active season
-  const urls = [`${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`];
+  // seasontype=2 = regular season, no year = ESPN picks current active season
+  const urls = [
+    `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?seasontype=2`,
+    `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`,
+  ];
 
   let data = null;
   for (const url of urls) {
