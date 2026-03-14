@@ -121,22 +121,12 @@ async function searchAthlete(sport, name) {
 async function getAthleteStats(sport, athleteId) {
   const {sport:s,league:l}=SPORTS[sport];
 
-  // Use team roster stats which always has current season data
-  // First get the player's current team, then pull from team stats
-  // Primary: core API with season filter
-  // For NBA/NHL current season = 2025, seasontype=2 (regular season)
-  const currentYear = "2025";
-  
+  // ESPN core API seasons/{year}/types/2 is the only reliable current-season endpoint
+  // year = end year of season: 2025-26 season = 2026, 2024-25 = 2025
+  // seasontype=2 = regular season
   const urlsToTry=[
-    // Current season regular season stats
-    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics/0?season=${currentYear}&seasontype=2`,
-    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics?season=${currentYear}&seasontype=2`,
-    // Site API current season
-    `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?season=${currentYear}&seasontype=2`,
-    `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?seasontype=2`,
-    // Fallback no params
-    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics/0`,
-    `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`,
+    `${COREAPI}/${s}/leagues/${l}/seasons/2026/types/2/athletes/${athleteId}/statistics`,
+    `${COREAPI}/${s}/leagues/${l}/seasons/2025/types/2/athletes/${athleteId}/statistics`,
   ];
 
   let data=null, usedUrl=null;
