@@ -269,29 +269,27 @@ app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
   }catch(err){console.error("Stats route error:",err.message);res.json(empty);}
 });
 
-// Debug endpoint — shows raw ESPN response structure
+// Debug endpoint — tries ALL urls, shows splits structure
 app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   const{sport:s,league:l}=SPORTS[sport];
-  const currentYear="2025";
   const urlsToTry=[
-    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/0?season=${currentYear}&seasontype=2`,
-    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/0`,
-    `${ESPN}/${s}/${l}/athletes/${id}/statistics?season=${currentYear}&seasontype=2`,
     `${ESPN}/${s}/${l}/athletes/${id}/statistics?seasontype=2`,
     `${ESPN}/${s}/${l}/athletes/${id}/statistics`,
+    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/0?season=2025&seasontype=2`,
+    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/0?seasontype=2`,
+    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/1?seasontype=2`,
+    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/2?seasontype=2`,
   ];
   const results=[];
   for(const url of urlsToTry){
     try{
       const{data}=await espnClient.get(url);
-      const topKeys=Object.keys(data).slice(0,10);
-      const cats=(data.splits?.categories||[]).map(c=>({name:c.name,statCount:(c.stats||[]).length,firstStats:(c.stats||[]).slice(0,3).map(s=>({name:s.name,abbr:s.abbreviation,value:s.value}))}));
-      const statGroups=(data.statistics||[]).map(g=>({name:g.name,namesCount:(g.names||[]).length,firstNames:(g.names||[]).slice(0,5),firstStats:(g.stats||[]).slice(0,5)}));
-      results.push({url,status:"OK",topKeys,hasSplits:!!(data.splits),hasStatistics:!!(data.statistics),splitCategories:cats.slice(0,4),statisticsGroups:statGroups.slice(0,3)});
-      break;
-    }catch(e){results.push({url,status:"ERROR",message:e.message});}
+      const cats=(data.splits?.categories||[]).map(c=>({name:c.name,firstStats:(c.stats||[]).slice(0,3).map(x=>({n:x.name,a:x.abbreviation,v:x.value}))}));
+      const statGroups=(data.statistics||[]).map(g=>({name:g.name,firstNames:(g.names||[]).slice(0,5),firstStats:(g.stats||[]).slice(0,5)}));
+      results.push({url,status:"OK",topKeys:Object.keys(data).slice(0,8),splitCats:cats.slice(0,5),statGroups:statGroups.slice(0,3)});
+    }catch(e){results.push({url,status:"ERROR",msg:e.message});}
   }
   res.json({athleteId:id,sport,results});
 });
