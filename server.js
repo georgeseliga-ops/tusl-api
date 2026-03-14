@@ -12,7 +12,7 @@ const caches = {
   live:      new NodeCache({ stdTTL: 20 }),
   standings: new NodeCache({ stdTTL: 300 }),
   teams:     new NodeCache({ stdTTL: 86400 }),
-  stats:     new NodeCache({ stdTTL: 300 }),
+  stats:     new NodeCache({ stdTTL: 60 }),  // 60s — keeps stats fresh
   search:    new NodeCache({ stdTTL: 604800 }),
 };
 
