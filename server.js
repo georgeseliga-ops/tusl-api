@@ -77,11 +77,13 @@ async function getTeams(sport) {
   return { sport:sport.toUpperCase(), teams:(data.sports?.[0]?.leagues?.[0]?.teams||[]).map(t=>({ id:t.team.id, name:t.team.displayName, abbreviation:t.team.abbreviation, logo:t.team.logos?.[0]?.href||null })) };
 }
 
+// ── Robust athlete search — scans team rosters (most reliable method) ────
 async function searchAthlete(sport, name) {
   const {sport:s, league:l} = SPORTS[sport];
   const nameLower = name.toLowerCase().replace(/[.']/g,"").trim();
   const nameParts = nameLower.split(/\s+/);
 
+  // Strategy 1: ESPN autocomplete
   try {
     const {data} = await espnClient.get("https://ac.espn.com/v2/ac", {
       params: { query:name, types:"athletes", limit:5, lang:"en", section:"espn" }
@@ -97,6 +99,7 @@ async function searchAthlete(sport, name) {
     }
   } catch(e) {}
 
+  // Strategy 2: ESPN common search
   try {
     const {data} = await espnClient.get("https://site.api.espn.com/apis/common/v3/search", {
       params: { query:name, sport:s, league:l, limit:5, type:"athlete" }
@@ -113,6 +116,7 @@ async function searchAthlete(sport, name) {
     }
   } catch(e) {}
 
+  // Strategy 3: Full roster scan (most reliable — scans all 30 team rosters)
   try {
     const teamsData = await getTeams(sport);
     for (const team of teamsData.teams) {
@@ -122,6 +126,7 @@ async function searchAthlete(sport, name) {
         const player = allPlayers.find(p => {
           const full = (p.fullName||p.displayName||"").toLowerCase().replace(/[.']/g,"").trim();
           const fullParts = full.split(/\s+/);
+          // Match on last name + first initial, or full name
           return full === nameLower ||
             full.includes(nameLower) ||
             (nameParts.length >= 2 &&
@@ -138,8 +143,11 @@ async function searchAthlete(sport, name) {
   return { found:false, query:name };
 }
 
+// ── Athlete stats ──────────────────────────────────────────────────────────
 async function getAthleteStats(sport, athleteId, season) {
   const {sport:s,league:l} = SPORTS[sport];
+
+  // Try with season param first, then without as fallback
   const urls = season
     ? [
         `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?season=${season}`,
@@ -152,22 +160,32 @@ async function getAthleteStats(sport, athleteId, season) {
     try {
       const resp = await espnClient.get(url);
       data = resp.data;
-      if (data && (data.statistics || data.athlete)) break;
-    } catch(e) { continue; }
+      if (data && (data.statistics || data.athlete)) break; // got valid data
+    } catch(e) {
+      // 404 or ESPN error — try next URL
+      continue;
+    }
   }
 
-  if (!data) return { athleteId, stats:{}, rawGroups:[], error:"ESPN stats unavailable" };
+  // If we couldn't get anything, return empty gracefully
+  if (!data) {
+    return { athleteId, stats: {}, rawGroups: [], error: "ESPN stats unavailable" };
+  }
 
   const athlete = data.athlete || {};
   let flat = {};
-  const statGroups = data.statistics || [];
-  const regGroup = statGroups.find(g => /regular\s*season/i.test(g.name || ""));
 
+  // Parse statistics array — prefer Regular Season group
+  const statGroups = data.statistics || [];
+  
+  // First pass: look for explicit regular season group
+  const regGroup = statGroups.find(g => /regular\s*season/i.test(g.name || ""));
   if (regGroup) {
     const names = regGroup.names || regGroup.labels || [];
     const stats = regGroup.stats || regGroup.values || [];
     names.forEach((n, i) => { if (n) flat[n] = parseFloat(stats[i]) || 0; });
   } else {
+    // Second pass: use all non-playoff groups
     statGroups.forEach(group => {
       if (/(playoff|post)/i.test(group.name || "")) return;
       const names = group.names || group.labels || [];
@@ -176,6 +194,7 @@ async function getAthleteStats(sport, athleteId, season) {
     });
   }
 
+  // Also try splitCategories format
   try {
     (data.splitCategories || []).forEach(cat => {
       (cat.splits || []).forEach(split => {
@@ -204,6 +223,7 @@ async function getAthleteStats(sport, athleteId, season) {
   };
 }
 
+// ── Routes ────────────────────────────────────────────────────────────────
 app.get("/", (req,res) => res.json({ name:"T.U.S.L. API v3", sports:["mlb","nfl","nba","nhl"] }));
 app.get("/health", (req,res) => res.json({ status:"ok", uptime:`${Math.floor(process.uptime())}s` }));
 
@@ -251,6 +271,7 @@ app.get("/api/sports/:sport/teams", async (req,res) => {
   } catch(err) { res.status(500).json({ error:err.message }); }
 });
 
+// Search — cached 7 days, ESPN IDs are permanent
 app.get("/api/sports/:sport/athletes/search", async (req,res) => {
   const {sport}=req.params;
   const {name}=req.query;
@@ -263,6 +284,7 @@ app.get("/api/sports/:sport/athletes/search", async (req,res) => {
   } catch(err) { res.status(500).json({ error:err.message }); }
 });
 
+// Stats — NEVER returns 500, always returns usable JSON even if ESPN is down
 app.get("/api/sports/:sport/athletes/:id/stats", async (req,res) => {
   const {sport,id}=req.params;
   const {season}=req.query;
@@ -286,4 +308,3 @@ app.get("/api/sports/:sport/athletes/:id/stats", async (req,res) => {
 
 app.use((req,res)=>res.status(404).json({ error:"Not found" }));
 app.listen(PORT,()=>console.log(`\n🏆 T.U.S.L. API v3 running on port ${PORT}\n`));
-```
