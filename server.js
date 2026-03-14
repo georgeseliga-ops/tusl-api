@@ -124,10 +124,10 @@ async function getAthleteStats(sport, athleteId) {
   // ESPN core API seasons/{year}/types/2 is the only reliable current-season endpoint
   // year = end year of season: 2025-26 season = 2026, 2024-25 = 2025
   // seasontype=2 = regular season
-  // NBA 2025-26 = season year 2026, NHL 2025-26 = season year 2025
-  const seasonYear = (sport === "nba") ? "2026" : "2025";
+  // Try current and next season year — ESPN is inconsistent per sport
   const urlsToTry=[
-    `${COREAPI}/${s}/leagues/${l}/seasons/${seasonYear}/types/2/athletes/${athleteId}/statistics`,
+    `${COREAPI}/${s}/leagues/${l}/seasons/2026/types/2/athletes/${athleteId}/statistics`,
+    `${COREAPI}/${s}/leagues/${l}/seasons/2025/types/2/athletes/${athleteId}/statistics`,
   ];
 
   let data=null, usedUrl=null;
@@ -265,9 +265,20 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   const{sport:s,league:l}=SPORTS[sport];
-  const seasonYear=(sport==="nba")?"2026":"2025";
+  // Try both season years
+  const seasonYears=["2026","2025"];
+  let debugData=null, debugUrl=null;
+  for(const yr of seasonYears){
+    try{
+      const u=`${COREAPI}/${s}/leagues/${l}/seasons/${yr}/types/2/athletes/${id}/statistics`;
+      const r=await espnClient.get(u);
+      if(r.data&&r.data.splits){debugData=r.data;debugUrl=u;break;}
+    }catch(e){}
+  }
   try{
-    const url=`${COREAPI}/${s}/leagues/${l}/seasons/${seasonYear}/types/2/athletes/${id}/statistics`;
+    const url=debugUrl||"none";
+    const data=debugData;
+    if(!data) return res.json({error:"Both season years failed"});
     const{data}=await espnClient.get(url);
     const allStats={};
     (data.splits?.categories||[]).forEach(cat=>{
@@ -276,7 +287,7 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
       });
     });
     res.json({url,athleteId:id,sport,totalStats:Object.keys(allStats).length,allStats});
-  }catch(e){res.json({error:e.message,tried:`seasons/${seasonYear}`});}
+  }catch(e){res.json({error:e.message});}
 });
 
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
