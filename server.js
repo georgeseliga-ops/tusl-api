@@ -146,33 +146,80 @@ async function searchAthlete(sport, name) {
 // ── Athlete stats ──────────────────────────────────────────────────────────
 async function getAthleteStats(sport, athleteId, season) {
   const {sport:s,league:l} = SPORTS[sport];
-  const url = season
-    ? `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?season=${season}`
-    : `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`;
-  const {data} = await espnClient.get(url);
-  const athlete = data.athlete||{};
+
+  // Try with season param first, then without as fallback
+  const urls = season
+    ? [
+        `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?season=${season}`,
+        `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`,
+      ]
+    : [`${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`];
+
+  let data = null;
+  for (const url of urls) {
+    try {
+      const resp = await espnClient.get(url);
+      data = resp.data;
+      if (data && (data.statistics || data.athlete)) break; // got valid data
+    } catch(e) {
+      // 404 or ESPN error — try next URL
+      continue;
+    }
+  }
+
+  // If we couldn't get anything, return empty gracefully
+  if (!data) {
+    return { athleteId, stats: {}, rawGroups: [], error: "ESPN stats unavailable" };
+  }
+
+  const athlete = data.athlete || {};
   let flat = {};
-  (data.statistics||[]).forEach(group => {
-    const names = group.names||group.labels||[];
-    const stats = group.stats||group.values||[];
-    const isReg = /regular/i.test(group.name||"") || !/(playoff|post)/i.test(group.name||"");
-    if (isReg) names.forEach((n,i) => { flat[n] = parseFloat(stats[i])||0; });
-  });
-  (data.splitCategories||[]).forEach(cat => {
-    (cat.splits||[]).forEach(split => {
-      if (/total|season/i.test(split.abbreviation||split.displayName||"")) {
-        (split.stats||[]).forEach((val,i) => {
-          const n = (cat.names||cat.abbreviations||[])[i];
-          if (n) flat[n] = parseFloat(val)||0;
-        });
-      }
+
+  // Parse statistics array — prefer Regular Season group
+  const statGroups = data.statistics || [];
+  
+  // First pass: look for explicit regular season group
+  const regGroup = statGroups.find(g => /regular\s*season/i.test(g.name || ""));
+  if (regGroup) {
+    const names = regGroup.names || regGroup.labels || [];
+    const stats = regGroup.stats || regGroup.values || [];
+    names.forEach((n, i) => { if (n) flat[n] = parseFloat(stats[i]) || 0; });
+  } else {
+    // Second pass: use all non-playoff groups
+    statGroups.forEach(group => {
+      if (/(playoff|post)/i.test(group.name || "")) return;
+      const names = group.names || group.labels || [];
+      const stats = group.stats || group.values || [];
+      names.forEach((n, i) => { if (n && flat[n] === undefined) flat[n] = parseFloat(stats[i]) || 0; });
     });
-  });
+  }
+
+  // Also try splitCategories format
+  try {
+    (data.splitCategories || []).forEach(cat => {
+      (cat.splits || []).forEach(split => {
+        if (/total|season|regular/i.test(split.abbreviation || split.displayName || "")) {
+          const names = cat.names || cat.abbreviations || [];
+          (split.stats || []).forEach((val, i) => {
+            const n = names[i];
+            if (n && flat[n] === undefined) flat[n] = parseFloat(val) || 0;
+          });
+        }
+      });
+    });
+  } catch(e) {}
+
   return {
-    athleteId, name:athlete.fullName||athlete.displayName,
-    position:athlete.position?.abbreviation, team:athlete.team?.abbreviation,
-    stats:flat,
-    rawGroups:(data.statistics||[]).map(g=>({ name:g.name, names:g.names||g.labels||[], stats:(g.stats||g.values||[]).slice(0,30) }))
+    athleteId,
+    name: athlete.fullName || athlete.displayName || null,
+    position: athlete.position?.abbreviation || null,
+    team: athlete.team?.abbreviation || null,
+    stats: flat,
+    rawGroups: statGroups.map(g => ({
+      name: g.name || "",
+      names: (g.names || g.labels || []).slice(0, 30),
+      stats: (g.stats || g.values || []).slice(0, 30)
+    }))
   };
 }
 
