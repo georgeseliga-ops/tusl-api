@@ -3,11 +3,83 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const NodeCache = require("node-cache");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "tusl-secret-change-in-production";
+
 app.use(cors());
 app.use(express.json());
 
+// ── Database ──────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes("railway") ? { rejectUnauthorized: false } : false,
+});
+
+// Initialize schema on startup
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        team_id INTEGER UNIQUE NOT NULL,
+        team_name VARCHAR(100) NOT NULL,
+        owner_name VARCHAR(100) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        faab_balance INTEGER DEFAULT 400,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS rosters (
+        id SERIAL PRIMARY KEY,
+        team_id INTEGER NOT NULL,
+        sport VARCHAR(10) NOT NULL,
+        player_name VARCHAR(100) NOT NULL,
+        player_espn_id VARCHAR(20),
+        position VARCHAR(10) NOT NULL,
+        slot VARCHAR(20) NOT NULL DEFAULT 'active',
+        auction_price INTEGER DEFAULT 0,
+        added_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(team_id, sport, player_name)
+      );
+
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        team_id INTEGER NOT NULL,
+        type VARCHAR(20) NOT NULL,
+        sport VARCHAR(10) NOT NULL,
+        player_in VARCHAR(100),
+        player_out VARCHAR(100),
+        slot_change VARCHAR(50),
+        faab_spent INTEGER DEFAULT 0,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS waiver_bids (
+        id SERIAL PRIMARY KEY,
+        team_id INTEGER NOT NULL,
+        sport VARCHAR(10) NOT NULL,
+        player_name VARCHAR(100) NOT NULL,
+        bid_amount INTEGER NOT NULL,
+        drop_player VARCHAR(100),
+        status VARCHAR(20) DEFAULT 'pending',
+        processed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    console.log("✓ Database schema initialized");
+  } catch(err) {
+    console.error("DB init error:", err.message);
+  }
+}
+
+// ── Cache ─────────────────────────────────────────────────────────────────
 const caches = {
   live:     new NodeCache({ stdTTL: 20 }),
   standings:new NodeCache({ stdTTL: 300 }),
@@ -25,6 +97,7 @@ async function getOrFetch(type, key, fetchFn) {
   return { data: fresh, fromCache: false };
 }
 
+// ── ESPN Client ───────────────────────────────────────────────────────────
 const espnClient = axios.create({
   headers: {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -46,6 +119,19 @@ const SPORTS = {
   nhl: { sport:"hockey",     league:"nhl" },
 };
 
+// ── Auth Middleware ───────────────────────────────────────────────────────
+function authRequired(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (!token) return res.status(401).json({ error: "Login required" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch(e) {
+    res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// ── ESPN Helpers ──────────────────────────────────────────────────────────
 function fmtGame(e) {
   const c = e.competitions?.[0], s = c?.status;
   return {
@@ -84,23 +170,6 @@ async function searchAthlete(sport, name) {
   const nameLower=name.toLowerCase().replace(/[.']/g,"").trim();
   const nameParts=nameLower.split(/\s+/);
   try {
-    const {data}=await espnClient.get("https://ac.espn.com/v2/ac",{params:{query:name,types:"athletes",limit:5,lang:"en",section:"espn"}});
-    for(const item of(data?.items||data?.athletes||[])){
-      const uid=(item.uid||item.id||"").toString();
-      const match=uid.match(/a:(\d+)/);
-      const id=match?match[1]:uid.replace(/\D/g,"");
-      if(id&&id.length>3&&id!=="1") return{id,name:item.displayName||item.name||name,found:true,method:"autocomplete"};
-    }
-  } catch(e){}
-  try {
-    const {data}=await espnClient.get("https://site.api.espn.com/apis/common/v3/search",{params:{query:name,sport:s,league:l,limit:5,type:"athlete"}});
-    const allItems=[...(data?.results||[]).flatMap(r=>[...(r.contents||[]),...(r.athletes||[])]),...(data?.athletes||[])];
-    for(const item of allItems){
-      const id=(item?.id||"").toString();
-      if(id&&id.length>3&&id!=="1") return{id,name:item.displayName||item.fullName||name,found:true,method:"common-search"};
-    }
-  } catch(e){}
-  try {
     const teamsData=await getTeams(sport);
     for(const team of teamsData.teams){
       try{
@@ -111,7 +180,7 @@ async function searchAthlete(sport, name) {
           const fullParts=full.split(/\s+/);
           return full===nameLower||full.includes(nameLower)||(nameParts.length>=2&&fullParts[fullParts.length-1]===nameParts[nameParts.length-1]&&fullParts[0][0]===nameParts[0][0]);
         });
-        if(player?.id&&player.id.toString()!=="1") return{id:player.id.toString(),name:player.fullName||player.displayName||name,found:true,method:"roster-scan",team:team.abbreviation};
+        if(player?.id&&player.id.toString()!=="1") return{id:player.id.toString(),name:player.fullName||player.displayName||name,found:true,team:team.abbreviation,position:player.position?.abbreviation};
       } catch(e){}
     }
   } catch(e){}
@@ -136,12 +205,243 @@ async function getAthleteStats(sport, athleteId) {
       if(stat.abbreviation) flat[stat.abbreviation]=parseFloat(stat.value)||0;
     });
   });
-  const athlete=data.athlete||{};
-  return{athleteId,name:athlete.displayName||null,stats:flat,statCount:Object.keys(flat).length};
+  return{athleteId,name:data.athlete?.displayName||null,stats:flat};
 }
 
-app.get("/",(req,res)=>res.json({name:"T.U.S.L. API v4",sports:["mlb","nfl","nba","nhl"]}));
-app.get("/health",(req,res)=>res.json({status:"ok",uptime:`${Math.floor(process.uptime())}s`}));
+// ── Free Agent Search ─────────────────────────────────────────────────────
+// Returns players on current rosters who aren't in any T.U.S.L. team
+async function getFreeAgents(sport, position) {
+  const {sport:s,league:l}=SPORTS[sport];
+  const teamsData = await getTeams(sport);
+  const allPlayers = [];
+
+  for(const team of teamsData.teams) {
+    try{
+      const {data}=await espnClient.get(`${ESPN}/${s}/${l}/teams/${team.id}/roster`);
+      const players=(data.athletes||[]).flatMap(g=>(g.items||g.athletes||[g])).filter(p=>p?.id);
+      players.forEach(p => {
+        const pos = p.position?.abbreviation || "";
+        if (!position || pos === position || pos.includes(position)) {
+          allPlayers.push({
+            id: p.id,
+            name: p.fullName || p.displayName,
+            position: pos,
+            team: team.abbreviation,
+            teamName: team.name,
+          });
+        }
+      });
+    } catch(e){}
+  }
+  return allPlayers;
+}
+
+// ── Auth Routes ───────────────────────────────────────────────────────────
+
+// Register new team owner
+app.post("/api/auth/register", async (req, res) => {
+  const { teamId, teamName, ownerName, email, password } = req.body;
+  if (!teamId || !email || !password || !ownerName) {
+    return res.status(400).json({ error: "teamId, ownerName, email and password required" });
+  }
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      `INSERT INTO users (team_id, team_name, owner_name, email, password_hash)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id, team_id, team_name, owner_name, email, faab_balance`,
+      [teamId, teamName, ownerName, email.toLowerCase(), hash]
+    );
+    const user = result.rows[0];
+    const token = jwt.sign({ userId: user.id, teamId: user.team_id, teamName: user.team_name }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, user });
+  } catch(err) {
+    if (err.code === "23505") return res.status(400).json({ error: "Email or team already registered" });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Login
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+  try {
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email.toLowerCase()]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: "Invalid email or password" });
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: "Invalid email or password" });
+    const token = jwt.sign({ userId: user.id, teamId: user.team_id, teamName: user.team_name }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, user: { id: user.id, teamId: user.team_id, teamName: user.team_name, ownerName: user.owner_name, email: user.email, faabBalance: user.faab_balance } });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get current user
+app.get("/api/auth/me", authRequired, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, team_id, team_name, owner_name, email, faab_balance FROM users WHERE id = $1", [req.user.userId]);
+    res.json(result.rows[0] || {});
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Roster Routes ─────────────────────────────────────────────────────────
+
+// Get team roster from DB
+app.get("/api/roster/:teamId", authRequired, async (req, res) => {
+  const { teamId } = req.params;
+  if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Can only view your own roster" });
+  try {
+    const result = await pool.query(
+      "SELECT * FROM rosters WHERE team_id = $1 ORDER BY sport, slot, added_at",
+      [teamId]
+    );
+    res.json({ teamId: parseInt(teamId), roster: result.rows });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Move player to/from IR
+app.post("/api/roster/ir-move", authRequired, async (req, res) => {
+  const { playerName, sport, direction } = req.body; // direction: "to-ir" | "from-ir"
+  if (!playerName || !sport || !direction) return res.status(400).json({ error: "playerName, sport, direction required" });
+  try {
+    const newSlot = direction === "to-ir" ? "ir" : "active";
+    await pool.query(
+      "UPDATE rosters SET slot = $1 WHERE team_id = $2 AND sport = $3 AND player_name = $4",
+      [newSlot, req.user.teamId, sport, playerName]
+    );
+    await pool.query(
+      "INSERT INTO transactions (team_id, type, sport, player_in, slot_change) VALUES ($1, $2, $3, $4, $5)",
+      [req.user.teamId, "ir-move", sport, playerName, `${direction === "to-ir" ? "Active→IR" : "IR→Active"}`]
+    );
+    res.json({ success: true, player: playerName, slot: newSlot });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Drop player
+app.post("/api/roster/drop", authRequired, async (req, res) => {
+  const { playerName, sport } = req.body;
+  if (!playerName || !sport) return res.status(400).json({ error: "playerName and sport required" });
+  try {
+    await pool.query(
+      "DELETE FROM rosters WHERE team_id = $1 AND sport = $2 AND player_name = $3",
+      [req.user.teamId, sport, playerName]
+    );
+    await pool.query(
+      "INSERT INTO transactions (team_id, type, sport, player_out) VALUES ($1, $2, $3, $4)",
+      [req.user.teamId, "drop", sport, playerName]
+    );
+    res.json({ success: true, dropped: playerName });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Waiver / Free Agent Routes ─────────────────────────────────────────────
+
+// Browse free agents by sport
+app.get("/api/freeagents/:sport", async (req, res) => {
+  const { sport } = req.params;
+  const { position, search } = req.query;
+  if (!SPORTS[sport]) return res.status(400).json({ error: "Invalid sport" });
+  try {
+    // Get all rostered players in T.U.S.L.
+    const rostered = await pool.query("SELECT player_name FROM rosters WHERE sport = $1", [sport]);
+    const rosteredNames = new Set(rostered.rows.map(r => r.player_name.toLowerCase()));
+
+    // Get all players from ESPN rosters
+    const allPlayers = await getFreeAgents(sport, position);
+
+    // Filter: not in any T.U.S.L. roster, optionally search by name
+    const freeAgents = allPlayers.filter(p => {
+      const name = (p.name||"").toLowerCase();
+      if (rosteredNames.has(name)) return false;
+      if (search && !name.includes(search.toLowerCase())) return false;
+      return true;
+    });
+
+    res.json({ sport, freeAgents: freeAgents.slice(0, 50), total: freeAgents.length });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Submit FAAB waiver bid
+app.post("/api/waivers/bid", authRequired, async (req, res) => {
+  const { playerName, sport, bidAmount, dropPlayer } = req.body;
+  if (!playerName || !sport || bidAmount === undefined) {
+    return res.status(400).json({ error: "playerName, sport, bidAmount required" });
+  }
+  try {
+    // Check FAAB balance
+    const userResult = await pool.query("SELECT faab_balance FROM users WHERE id = $1", [req.user.userId]);
+    const balance = userResult.rows[0]?.faab_balance || 0;
+    if (bidAmount > balance) return res.status(400).json({ error: `Insufficient FAAB. Balance: $${balance}` });
+    if (bidAmount < 0) return res.status(400).json({ error: "Bid must be $0 or more" });
+
+    // Check for existing bid on this player
+    await pool.query(
+      `INSERT INTO waiver_bids (team_id, sport, player_name, bid_amount, drop_player)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT DO NOTHING`,
+      [req.user.teamId, sport, playerName, bidAmount, dropPlayer || null]
+    );
+    res.json({ success: true, message: `$${bidAmount} bid placed on ${playerName}`, remainingBalance: balance });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get my pending bids
+app.get("/api/waivers/my-bids", authRequired, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM waiver_bids WHERE team_id = $1 AND status = 'pending' ORDER BY created_at DESC",
+      [req.user.teamId]
+    );
+    res.json({ bids: result.rows });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Cancel a bid
+app.delete("/api/waivers/bid/:bidId", authRequired, async (req, res) => {
+  try {
+    await pool.query(
+      "DELETE FROM waiver_bids WHERE id = $1 AND team_id = $2 AND status = 'pending'",
+      [req.params.bidId, req.user.teamId]
+    );
+    res.json({ success: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get transaction log
+app.get("/api/transactions/:teamId", authRequired, async (req, res) => {
+  const { teamId } = req.params;
+  if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Can only view your own transactions" });
+  try {
+    const result = await pool.query(
+      "SELECT * FROM transactions WHERE team_id = $1 ORDER BY created_at DESC LIMIT 50",
+      [teamId]
+    );
+    res.json({ transactions: result.rows });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Existing ESPN routes ───────────────────────────────────────────────────
+app.get("/",(req,res)=>res.json({name:"T.U.S.L. API v5 — with Auth & DB",sports:["mlb","nfl","nba","nhl"]}));
+app.get("/health",(req,res)=>res.json({status:"ok",uptime:`${Math.floor(process.uptime())}s`,db:"connected"}));
 
 app.get("/api/dashboard",async(req,res)=>{
   try{
@@ -159,41 +459,30 @@ app.get("/api/dashboard",async(req,res)=>{
 app.get("/api/sports/:sport/scoreboard",async(req,res)=>{
   const{sport}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  try{
-    if(req.query.refresh==="true") caches.live.del(`sb_${sport}`);
-    const{data,fromCache}=await getOrFetch("live",`sb_${sport}`,()=>getScoreboard(sport));
-    res.json({...data,fromCache});
-  }catch(err){res.status(500).json({error:err.message});}
+  try{if(req.query.refresh==="true")caches.live.del(`sb_${sport}`);const{data,fromCache}=await getOrFetch("live",`sb_${sport}`,()=>getScoreboard(sport));res.json({...data,fromCache});}
+  catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/standings",async(req,res)=>{
   const{sport}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  try{
-    const{data,fromCache}=await getOrFetch("standings",`st_${sport}`,()=>getStandings(sport));
-    res.json({...data,fromCache});
-  }catch(err){res.status(500).json({error:err.message});}
+  try{const{data,fromCache}=await getOrFetch("standings",`st_${sport}`,()=>getStandings(sport));res.json({...data,fromCache});}
+  catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/teams",async(req,res)=>{
   const{sport}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  try{
-    const{data,fromCache}=await getOrFetch("teams",`tm_${sport}`,()=>getTeams(sport));
-    res.json({...data,fromCache});
-  }catch(err){res.status(500).json({error:err.message});}
+  try{const{data,fromCache}=await getOrFetch("teams",`tm_${sport}`,()=>getTeams(sport));res.json({...data,fromCache});}
+  catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/athletes/search",async(req,res)=>{
-  const{sport}=req.params;
-  const{name}=req.query;
+  const{sport}=req.params;const{name}=req.query;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   if(!name) return res.status(400).json({error:"?name= required"});
-  try{
-    const cacheKey=`search_${sport}_${name.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}`;
-    const{data}=await getOrFetch("search",cacheKey,()=>searchAthlete(sport,name));
-    res.json(data);
-  }catch(err){res.status(500).json({error:err.message});}
+  try{const cacheKey=`search_${sport}_${name.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}`;const{data}=await getOrFetch("search",cacheKey,()=>searchAthlete(sport,name));res.json(data);}
+  catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
@@ -205,18 +494,19 @@ app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
     const cached=caches.stats.get(cacheKey);
     if(cached!==undefined) return res.json({...cached,fromCache:true});
     let result=empty;
-    try{
-      result=await getAthleteStats(sport,id);
-      if(result&&Object.keys(result.stats||{}).length>0) caches.stats.set(cacheKey,result);
-    }catch(e){console.error("stats error",sport,id,e.message);}
+    try{result=await getAthleteStats(sport,id);if(result&&Object.keys(result.stats||{}).length>0)caches.stats.set(cacheKey,result);}
+    catch(e){console.error("stats error",sport,id,e.message);}
     res.json({...result,fromCache:false});
-  }catch(err){
-    console.error("stats route error",err.message);
-    res.json(empty);
-  }
+  }catch(err){console.error("stats route error",err.message);res.json(empty);}
 });
 
-// Debug: look up player by name and get their correct ESPN ID + stats
+app.get("/api/findplayer/:sport/:name",async(req,res)=>{
+  const{sport,name}=req.params;
+  if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
+  try{const result=await searchAthlete(sport,decodeURIComponent(name));res.json(result);}
+  catch(err){res.json({error:err.message});}
+});
+
 app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
@@ -228,11 +518,7 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
       const{data}=await espnClient.get(url);
       if(data&&data.splits){
         const allStats={};
-        (data.splits.categories||[]).forEach(cat=>{
-          (cat.stats||[]).forEach(stat=>{
-            allStats[stat.name]={abbr:stat.abbreviation,value:stat.value,cat:cat.name};
-          });
-        });
+        (data.splits.categories||[]).forEach(cat=>{(cat.stats||[]).forEach(stat=>{allStats[stat.name]={abbr:stat.abbreviation,value:stat.value,cat:cat.name};});});
         return res.json({url,year:yr,totalStats:Object.keys(allStats).length,allStats});
       }
     }catch(e){continue;}
@@ -240,15 +526,11 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
   res.json({error:"both years failed",sport,id});
 });
 
-// Find correct ESPN ID by searching rosters
-app.get("/api/findplayer/:sport/:name",async(req,res)=>{
-  const{sport,name}=req.params;
-  if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  try{
-    const result=await searchAthlete(sport,decodeURIComponent(name));
-    res.json(result);
-  }catch(err){res.json({error:err.message});}
-});
-
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
-app.listen(PORT,()=>console.log(`\n🏆 T.U.S.L. API v4 running on port ${PORT}\n`));
+
+// Start
+async function start() {
+  await initDB();
+  app.listen(PORT, () => console.log(`\n🏆 T.U.S.L. API v5 running on port ${PORT}\n`));
+}
+start();
