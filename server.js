@@ -120,39 +120,70 @@ async function searchAthlete(sport, name) {
 
 async function getAthleteStats(sport, athleteId) {
   const {sport:s,league:l}=SPORTS[sport];
+
+  // Use team roster stats which always has current season data
+  // First get the player's current team, then pull from team stats
+  // Primary: core API with season filter
+  // For NBA/NHL current season = 2025, seasontype=2 (regular season)
+  const currentYear = "2025";
+  
   const urlsToTry=[
-    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics/0`,
-    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics`,
+    // Current season regular season stats
+    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics/0?season=${currentYear}&seasontype=2`,
+    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics?season=${currentYear}&seasontype=2`,
+    // Site API current season
+    `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?season=${currentYear}&seasontype=2`,
     `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?seasontype=2`,
+    // Fallback no params
+    `${COREAPI}/${s}/leagues/${l}/athletes/${athleteId}/statistics/0`,
     `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`,
   ];
+
   let data=null, usedUrl=null;
   for(const url of urlsToTry){
     try{
       const resp=await espnClient.get(url);
-      if(resp.data&&Object.keys(resp.data).length>1){data=resp.data;usedUrl=url;break;}
+      if(resp.data&&Object.keys(resp.data).length>1){
+        data=resp.data;
+        usedUrl=url;
+        break;
+      }
     }catch(e){continue;}
   }
   if(!data) return{athleteId,stats:{},rawGroups:[],error:"No ESPN endpoint returned data"};
+
   let flat={};
+
+  // Core API format: splits.categories[].stats[]
+  // IMPORTANT: filter to current season splits only (not career)
   try{
-    const cats=data.splits?.categories||data.categories||[];
+    const cats=data.splits?.categories||[];
+    // Look for "Regular Season" split, not "Career"  
     cats.forEach(cat=>{
+      // Skip career categories
+      if(/career/i.test(cat.name||"")) return;
       (cat.stats||[]).forEach(stat=>{
-        if(stat.name) flat[stat.name]=parseFloat(stat.value)||0;
-        if(stat.abbreviation) flat[stat.abbreviation]=parseFloat(stat.value)||0;
+        if(stat.name)         flat[stat.name]         = parseFloat(stat.value)||0;
+        if(stat.abbreviation) flat[stat.abbreviation] = parseFloat(stat.value)||0;
       });
     });
   }catch(e){}
+
+  // Site API format: statistics[].names + stats
   try{
     const statGroups=data.statistics||[];
-    const regGroup=statGroups.find(g=>/regular/i.test(g.name||""))||statGroups.find(g=>!/(playoff|post)/i.test(g.name||""));
+    // Prefer regular season, avoid career/playoff
+    const regGroup=statGroups.find(g=>/regular\s*season/i.test(g.name||""))
+      || statGroups.find(g=>/^(?!.*career)(?!.*playoff)(?!.*post)/i.test(g.name||""))
+      || statGroups[0];
     if(regGroup){
       const names=regGroup.names||regGroup.labels||[];
       const stats=regGroup.stats||regGroup.values||[];
       names.forEach((n,i)=>{if(n)flat[n]=parseFloat(stats[i])||0;});
     }
   }catch(e){}
+
+  // splitCategories format
   try{
     (data.splitCategories||[]).forEach(cat=>{
       (cat.splits||[]).forEach(split=>{
@@ -163,9 +194,19 @@ async function getAthleteStats(sport, athleteId) {
       });
     });
   }catch(e){}
+
   const athlete=data.athlete||data.person||{};
-  return{athleteId,usedUrl,name:athlete.fullName||athlete.displayName||null,stats:flat,statCount:Object.keys(flat).length,
-    rawGroups:(data.statistics||[]).slice(0,2).map(g=>({name:g.name||"",names:(g.names||g.labels||[]).slice(0,15),stats:(g.stats||g.values||[]).slice(0,15)}))};
+  return{
+    athleteId, usedUrl,
+    name:athlete.fullName||athlete.displayName||null,
+    stats:flat,
+    statCount:Object.keys(flat).length,
+    rawGroups:(data.statistics||[]).slice(0,2).map(g=>({
+      name:g.name||"",
+      names:(g.names||g.labels||[]).slice(0,15),
+      stats:(g.stats||g.values||[]).slice(0,15)
+    }))
+  };
 }
 
 app.get("/",(req,res)=>res.json({name:"T.U.S.L. API v4",sports:["mlb","nfl","nba","nhl"]}));
@@ -228,13 +269,16 @@ app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
   }catch(err){console.error("Stats route error:",err.message);res.json(empty);}
 });
 
+// Debug endpoint — shows raw ESPN response structure
 app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   const{sport:s,league:l}=SPORTS[sport];
+  const currentYear="2025";
   const urlsToTry=[
+    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/0?season=${currentYear}&seasontype=2`,
     `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/0`,
-    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics`,
+    `${ESPN}/${s}/${l}/athletes/${id}/statistics?season=${currentYear}&seasontype=2`,
     `${ESPN}/${s}/${l}/athletes/${id}/statistics?seasontype=2`,
     `${ESPN}/${s}/${l}/athletes/${id}/statistics`,
   ];
@@ -242,11 +286,10 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
   for(const url of urlsToTry){
     try{
       const{data}=await espnClient.get(url);
-      const keys=Object.keys(data);
-      results.push({url,status:"OK",topKeys:keys.slice(0,10),hasSplits:!!(data.splits),hasStatistics:!!(data.statistics),
-        splitsCategories:(data.splits?.categories||[]).map(c=>c.name).slice(0,5),
-        statisticsNames:(data.statistics||[]).map(g=>g.name).slice(0,5),
-        firstSample:JSON.stringify(data.splits?.categories?.[0]||data.statistics?.[0]||{}).slice(0,400)});
+      const topKeys=Object.keys(data).slice(0,10);
+      const cats=(data.splits?.categories||[]).map(c=>({name:c.name,statCount:(c.stats||[]).length,firstStats:(c.stats||[]).slice(0,3).map(s=>({name:s.name,abbr:s.abbreviation,value:s.value}))}));
+      const statGroups=(data.statistics||[]).map(g=>({name:g.name,namesCount:(g.names||[]).length,firstNames:(g.names||[]).slice(0,5),firstStats:(g.stats||[]).slice(0,5)}));
+      results.push({url,status:"OK",topKeys,hasSplits:!!(data.splits),hasStatistics:!!(data.statistics),splitCategories:cats.slice(0,4),statisticsGroups:statGroups.slice(0,3)});
       break;
     }catch(e){results.push({url,status:"ERROR",message:e.message});}
   }
