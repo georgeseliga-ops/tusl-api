@@ -259,33 +259,22 @@ app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
   }catch(err){console.error("Stats route error:",err.message);res.json(empty);}
 });
 
-// Debug endpoint
+// Debug endpoint — dumps ALL stat field names and values
 app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   const{sport:s,league:l}=SPORTS[sport];
-  // Try ESPN's event log and gamelog endpoints which have current season stats
-  const urlsToTry=[
-    `${COREAPI}/${s}/leagues/${l}/seasons/2025/types/2/athletes/${id}/statistics`,
-    `${ESPN}/${s}/${l}/athletes/${id}/gamelog`,
-    `${ESPN}/${s}/${l}/athletes/${id}/overview`,
-    `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/stats`,
-    `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/stats?region=us&lang=en&contentorigin=espn&season=2025&seasontype=2`,
-    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/eventlog?season=2025&seasontype=2&limit=1`,
-  ];
-  const results=[];
-  for(const url of urlsToTry){
-    try{
-      const{data}=await espnClient.get(url);
-      const keys=Object.keys(data).slice(0,12);
-      const cats=(data.splits?.categories||data.categories||[]).map(c=>({name:c.name,first3:(c.stats||[]).slice(0,3).map(x=>({n:x.name,a:x.abbreviation,v:x.value}))}));
-      const statGroups=(data.statistics||[]).map(g=>({name:g.name,firstNames:(g.names||[]).slice(0,5),firstStats:(g.stats||[]).slice(0,5)}));
-      results.push({url,status:"OK",topKeys:keys,splitCats:cats.slice(0,4),statGroups:statGroups.slice(0,3),
-        hasFilters:!!(data.filters),filtersInfo:(data.filters||[]).slice(0,3).map(f=>({n:f.name,v:f.value}))
+  try{
+    const url=`${COREAPI}/${s}/leagues/${l}/seasons/2026/types/2/athletes/${id}/statistics`;
+    const{data}=await espnClient.get(url);
+    const allStats={};
+    (data.splits?.categories||[]).forEach(cat=>{
+      (cat.stats||[]).forEach(stat=>{
+        allStats[stat.name]={abbr:stat.abbreviation,value:stat.value,category:cat.name};
       });
-    }catch(e){results.push({url,status:"ERROR",msg:e.message});}
-  }
-  res.json({athleteId:id,sport,results});
+    });
+    res.json({url,athleteId:id,sport,totalStats:Object.keys(allStats).length,allStats});
+  }catch(e){res.json({error:e.message});}
 });
 
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
