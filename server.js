@@ -287,7 +287,3 @@ app.get("/api/sports/:sport/athletes/:id/stats", async (req,res) => {
 app.use((req,res)=>res.status(404).json({ error:"Not found" }));
 app.listen(PORT,()=>console.log(`\n🏆 T.U.S.L. API v3 running on port ${PORT}\n`));
 ```
-
-Paste that in, commit, and Railway will redeploy. Once it's active, open this URL in your browser to test one player directly:
-```
-https://tusl-api-production.up.railway.app/api/sports/nhl/athletes/3042140/stats
