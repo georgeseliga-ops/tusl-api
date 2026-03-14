@@ -120,84 +120,25 @@ async function searchAthlete(sport, name) {
 
 async function getAthleteStats(sport, athleteId) {
   const {sport:s,league:l}=SPORTS[sport];
-
-  // ESPN core API seasons/{year}/types/2 is the only reliable current-season endpoint
-  // year = end year of season: 2025-26 season = 2026, 2024-25 = 2025
-  // seasontype=2 = regular season
-  // Try current and next season year — ESPN is inconsistent per sport
-  const urlsToTry=[
-    `${COREAPI}/${s}/leagues/${l}/seasons/2026/types/2/athletes/${athleteId}/statistics`,
-    `${COREAPI}/${s}/leagues/${l}/seasons/2025/types/2/athletes/${athleteId}/statistics`,
-  ];
-
-  let data=null, usedUrl=null;
-  for(const url of urlsToTry){
+  // Try season years 2026 then 2025 — ESPN is inconsistent
+  const years=["2026","2025"];
+  let data=null;
+  for(const yr of years){
     try{
-      const resp=await espnClient.get(url);
-      if(resp.data&&Object.keys(resp.data).length>1){
-        data=resp.data;
-        usedUrl=url;
-        break;
-      }
+      const resp=await espnClient.get(`${COREAPI}/${s}/leagues/${l}/seasons/${yr}/types/2/athletes/${athleteId}/statistics`);
+      if(resp.data&&resp.data.splits){data=resp.data;break;}
     }catch(e){continue;}
   }
-  if(!data) return{athleteId,stats:{},rawGroups:[],error:"No ESPN endpoint returned data"};
-
-  let flat={};
-
-  // Core API format: splits.categories[].stats[]
-  // IMPORTANT: filter to current season splits only (not career)
-  try{
-    const cats=data.splits?.categories||[];
-    // Look for "Regular Season" split, not "Career"  
-    cats.forEach(cat=>{
-      // Skip career categories
-      if(/career/i.test(cat.name||"")) return;
-      (cat.stats||[]).forEach(stat=>{
-        if(stat.name)         flat[stat.name]         = parseFloat(stat.value)||0;
-        if(stat.abbreviation) flat[stat.abbreviation] = parseFloat(stat.value)||0;
-      });
+  if(!data) return{athleteId,stats:{},error:"no data"};
+  const flat={};
+  (data.splits?.categories||[]).forEach(cat=>{
+    (cat.stats||[]).forEach(stat=>{
+      if(stat.name) flat[stat.name]=parseFloat(stat.value)||0;
+      if(stat.abbreviation) flat[stat.abbreviation]=parseFloat(stat.value)||0;
     });
-  }catch(e){}
-
-  // Site API format: statistics[].names + stats
-  try{
-    const statGroups=data.statistics||[];
-    // Prefer regular season, avoid career/playoff
-    const regGroup=statGroups.find(g=>/regular\s*season/i.test(g.name||""))
-      || statGroups.find(g=>/^(?!.*career)(?!.*playoff)(?!.*post)/i.test(g.name||""))
-      || statGroups[0];
-    if(regGroup){
-      const names=regGroup.names||regGroup.labels||[];
-      const stats=regGroup.stats||regGroup.values||[];
-      names.forEach((n,i)=>{if(n)flat[n]=parseFloat(stats[i])||0;});
-    }
-  }catch(e){}
-
-  // splitCategories format
-  try{
-    (data.splitCategories||[]).forEach(cat=>{
-      (cat.splits||[]).forEach(split=>{
-        if(/total|season|regular/i.test(split.abbreviation||split.displayName||"")){
-          const names=cat.names||cat.abbreviations||[];
-          (split.stats||[]).forEach((val,i)=>{const n=names[i];if(n&&flat[n]===undefined)flat[n]=parseFloat(val)||0;});
-        }
-      });
-    });
-  }catch(e){}
-
-  const athlete=data.athlete||data.person||{};
-  return{
-    athleteId, usedUrl,
-    name:athlete.fullName||athlete.displayName||null,
-    stats:flat,
-    statCount:Object.keys(flat).length,
-    rawGroups:(data.statistics||[]).slice(0,2).map(g=>({
-      name:g.name||"",
-      names:(g.names||g.labels||[]).slice(0,15),
-      stats:(g.stats||g.values||[]).slice(0,15)
-    }))
-  };
+  });
+  const athlete=data.athlete||{};
+  return{athleteId,name:athlete.displayName||null,stats:flat,statCount:Object.keys(flat).length};
 }
 
 app.get("/",(req,res)=>res.json({name:"T.U.S.L. API v4",sports:["mlb","nfl","nba","nhl"]}));
@@ -219,75 +160,84 @@ app.get("/api/dashboard",async(req,res)=>{
 app.get("/api/sports/:sport/scoreboard",async(req,res)=>{
   const{sport}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  try{if(req.query.refresh==="true")caches.live.del(`sb_${sport}`);const{data,fromCache}=await getOrFetch("live",`sb_${sport}`,()=>getScoreboard(sport));res.json({...data,fromCache});}
-  catch(err){res.status(500).json({error:err.message});}
+  try{
+    if(req.query.refresh==="true") caches.live.del(`sb_${sport}`);
+    const{data,fromCache}=await getOrFetch("live",`sb_${sport}`,()=>getScoreboard(sport));
+    res.json({...data,fromCache});
+  }catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/standings",async(req,res)=>{
   const{sport}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  try{const{data,fromCache}=await getOrFetch("standings",`st_${sport}`,()=>getStandings(sport));res.json({...data,fromCache});}
-  catch(err){res.status(500).json({error:err.message});}
+  try{
+    const{data,fromCache}=await getOrFetch("standings",`st_${sport}`,()=>getStandings(sport));
+    res.json({...data,fromCache});
+  }catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/teams",async(req,res)=>{
   const{sport}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  try{const{data,fromCache}=await getOrFetch("teams",`tm_${sport}`,()=>getTeams(sport));res.json({...data,fromCache});}
-  catch(err){res.status(500).json({error:err.message});}
+  try{
+    const{data,fromCache}=await getOrFetch("teams",`tm_${sport}`,()=>getTeams(sport));
+    res.json({...data,fromCache});
+  }catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/athletes/search",async(req,res)=>{
-  const{sport}=req.params;const{name}=req.query;
+  const{sport}=req.params;
+  const{name}=req.query;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   if(!name) return res.status(400).json({error:"?name= required"});
-  try{const cacheKey=`search_${sport}_${name.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}`;const{data}=await getOrFetch("search",cacheKey,()=>searchAthlete(sport,name));res.json(data);}
-  catch(err){res.status(500).json({error:err.message});}
+  try{
+    const cacheKey=`search_${sport}_${name.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"")}`;
+    const{data}=await getOrFetch("search",cacheKey,()=>searchAthlete(sport,name));
+    res.json(data);
+  }catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
-  const empty={athleteId:id,stats:{},rawGroups:[],fromCache:false};
+  const empty={athleteId:id,stats:{},fromCache:false};
   try{
     const cacheKey=`stats_${sport}_${id}`;
     const cached=caches.stats.get(cacheKey);
     if(cached!==undefined) return res.json({...cached,fromCache:true});
     let result=empty;
-    try{result=await getAthleteStats(sport,id);if(result&&Object.keys(result.stats||{}).length>0)caches.stats.set(cacheKey,result);}
-    catch(e){console.error("Stats error",sport,id,e.message);}
+    try{
+      result=await getAthleteStats(sport,id);
+      if(result&&Object.keys(result.stats||{}).length>0) caches.stats.set(cacheKey,result);
+    }catch(e){console.error("stats error",sport,id,e.message);}
     res.json({...result,fromCache:false});
-  }catch(err){console.error("Stats route error:",err.message);res.json(empty);}
+  }catch(err){
+    console.error("stats route error",err.message);
+    res.json(empty);
+  }
 });
 
-// Debug endpoint — dumps ALL stat field names and values
 app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   const{sport:s,league:l}=SPORTS[sport];
-  // Try both season years
-  const seasonYears=["2026","2025"];
-  let debugData=null, debugUrl=null;
-  for(const yr of seasonYears){
+  const years=["2026","2025"];
+  for(const yr of years){
     try{
-      const u=`${COREAPI}/${s}/leagues/${l}/seasons/${yr}/types/2/athletes/${id}/statistics`;
-      const r=await espnClient.get(u);
-      if(r.data&&r.data.splits){debugData=r.data;debugUrl=u;break;}
-    }catch(e){}
+      const url=`${COREAPI}/${s}/leagues/${l}/seasons/${yr}/types/2/athletes/${id}/statistics`;
+      const{data}=await espnClient.get(url);
+      if(data&&data.splits){
+        const allStats={};
+        (data.splits.categories||[]).forEach(cat=>{
+          (cat.stats||[]).forEach(stat=>{
+            allStats[stat.name]={abbr:stat.abbreviation,value:stat.value,cat:cat.name};
+          });
+        });
+        return res.json({url,year:yr,totalStats:Object.keys(allStats).length,allStats});
+      }
+    }catch(e){continue;}
   }
-  try{
-    const url=debugUrl||"none";
-    const data=debugData;
-    if(!data) return res.json({error:"Both season years failed"});
-    const{data}=await espnClient.get(url);
-    const allStats={};
-    (data.splits?.categories||[]).forEach(cat=>{
-      (cat.stats||[]).forEach(stat=>{
-        allStats[stat.name]={abbr:stat.abbreviation,value:stat.value,category:cat.name};
-      });
-    });
-    res.json({url,athleteId:id,sport,totalStats:Object.keys(allStats).length,allStats});
-  }catch(e){res.json({error:e.message});}
+  res.json({error:"both years failed",sport,id});
 });
 
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
