@@ -144,16 +144,10 @@ async function searchAthlete(sport, name) {
 }
 
 // ── Athlete stats ──────────────────────────────────────────────────────────
-async function getAthleteStats(sport, athleteId, season) {
+async function getAthleteStats(sport, athleteId) {
   const {sport:s,league:l} = SPORTS[sport];
-
-  // Try with season param first, then without as fallback
-  const urls = season
-    ? [
-        `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics?season=${season}`,
-        `${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`,
-      ]
-    : [`${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`];
+  // No season param — ESPN defaults to current active season
+  const urls = [`${ESPN}/${s}/${l}/athletes/${athleteId}/statistics`];
 
   let data = null;
   for (const url of urls) {
@@ -296,7 +290,7 @@ app.get("/api/sports/:sport/athletes/:id/stats", async (req,res) => {
     if (cached !== undefined) return res.json({...cached, fromCache:true});
     let result = empty;
     try {
-      result = await getAthleteStats(sport, id, season);
+      result = await getAthleteStats(sport, id);
       if (result && Object.keys(result.stats||{}).length > 0) caches.stats.set(cacheKey, result);
     } catch(e) { console.error("Stats ESPN error "+sport+"/"+id+":", e.message); }
     res.json({...result, fromCache:false});
