@@ -269,25 +269,30 @@ app.get("/api/sports/:sport/athletes/:id/stats",async(req,res)=>{
   }catch(err){console.error("Stats route error:",err.message);res.json(empty);}
 });
 
-// Debug endpoint — tries season-path based URLs
+// Debug endpoint
 app.get("/api/debug/:sport/:id",async(req,res)=>{
   const{sport,id}=req.params;
   if(!SPORTS[sport]) return res.status(400).json({error:"Invalid sport"});
   const{sport:s,league:l}=SPORTS[sport];
-  // Try explicit season-in-path format which is most reliable
+  // Try ESPN's event log and gamelog endpoints which have current season stats
   const urlsToTry=[
     `${COREAPI}/${s}/leagues/${l}/seasons/2025/types/2/athletes/${id}/statistics`,
-    `${COREAPI}/${s}/leagues/${l}/seasons/2026/types/2/athletes/${id}/statistics`,
-    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/statistics/0?season=2025&seasontype=2`,
-    `${ESPN}/${s}/${l}/athletes/${id}/statistics?seasontype=2`,
+    `${ESPN}/${s}/${l}/athletes/${id}/gamelog`,
+    `${ESPN}/${s}/${l}/athletes/${id}/overview`,
+    `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/stats`,
+    `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/stats?region=us&lang=en&contentorigin=espn&season=2025&seasontype=2`,
+    `${COREAPI}/${s}/leagues/${l}/athletes/${id}/eventlog?season=2025&seasontype=2&limit=1`,
   ];
   const results=[];
   for(const url of urlsToTry){
     try{
       const{data}=await espnClient.get(url);
-      const cats=(data.splits?.categories||data.categories||[]).map(c=>({name:c.name,firstStats:(c.stats||[]).slice(0,4).map(x=>({n:x.name,a:x.abbreviation,v:x.value}))}));
+      const keys=Object.keys(data).slice(0,12);
+      const cats=(data.splits?.categories||data.categories||[]).map(c=>({name:c.name,first3:(c.stats||[]).slice(0,3).map(x=>({n:x.name,a:x.abbreviation,v:x.value}))}));
       const statGroups=(data.statistics||[]).map(g=>({name:g.name,firstNames:(g.names||[]).slice(0,5),firstStats:(g.stats||[]).slice(0,5)}));
-      results.push({url,status:"OK",topKeys:Object.keys(data).slice(0,8),splitCats:cats.slice(0,5),statGroups:statGroups.slice(0,3)});
+      results.push({url,status:"OK",topKeys:keys,splitCats:cats.slice(0,4),statGroups:statGroups.slice(0,3),
+        hasFilters:!!(data.filters),filtersInfo:(data.filters||[]).slice(0,3).map(f=>({n:f.name,v:f.value}))
+      });
     }catch(e){results.push({url,status:"ERROR",msg:e.message});}
   }
   res.json({athleteId:id,sport,results});
