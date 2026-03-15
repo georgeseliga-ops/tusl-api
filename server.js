@@ -755,81 +755,122 @@ app.get("/api/sports/:sport/athletes/:id/gamelog", async (req, res) => {
   if (cached) return res.json({ ...cached, fromCache: true });
 
   try {
-    // ESPN site API has event logs
-    const url = `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/gamelog`;
-    const { data } = await espnClient.get(url);
-
-    const games = [];
-    const categories = data.categories || [];
-    const events = data.events || {};
-    const seasonTypes = data.seasonTypes || [];
-
-    // Flatten all event IDs in order
-    let allEventIds = [];
-    seasonTypes.forEach(st => {
-      (st.categories || []).forEach(cat => {
-        (cat.events || []).forEach(ev => {
-          if (!allEventIds.includes(ev.eventId)) allEventIds.push(ev.eventId);
-        });
-      });
-    });
-
-    // Build stat label map from categories
-    const statLabels = {};
-    categories.forEach(cat => {
-      (cat.labels || []).forEach((label, i) => {
-        statLabels[`${cat.type}_${i}`] = label;
-      });
-    });
-
-    // Get last N event IDs
-    const recentIds = allEventIds.slice(-limit);
-
-    for (const eventId of recentIds) {
-      const ev = events[eventId];
-      if (!ev) continue;
-      const gameStats = {};
-      categories.forEach(cat => {
-        const eventEntry = (cat.events || []).find(e => e.eventId === eventId);
-        if (!eventEntry) return;
-        (cat.labels || []).forEach((label, i) => {
-          gameStats[label] = eventEntry.stats?.[i] ?? '—';
-        });
-      });
-      games.push({
-        eventId,
-        date: ev.gameDate,
-        opponent: ev.opponent?.displayName || ev.opponent?.abbreviation || '—',
-        homeAway: ev.homeAway,
-        result: ev.gameResult,
-        stats: gameStats
-      });
+    const year = new Date().getFullYear();
+    // Try current year first, fallback to previous
+    let data = null;
+    for (const yr of [year, year - 1]) {
+      try {
+        const url = `${COREAPI}/${s}/leagues/${l}/seasons/${yr}/types/2/athletes/${id}/eventlog`;
+        const resp = await espnClient.get(url);
+        if (resp.data && resp.data.events) { data = resp.data; break; }
+      } catch(e) { continue; }
     }
 
-    const result = { games: games.reverse() }; // most recent first
+    if (!data || !data.events) {
+      return res.json({ games: [], note: 'No eventlog data found' });
+    }
+
+    const games = [];
+    const eventsMap = data.events; // { eventId: { ... } }
+    const items = data.events?.items || Object.values(eventsMap).filter(e => e && e.id);
+
+    // ESPN eventlog structure: events.items[] each with event ref + statistics
+    // Also try data.events as array
+    const eventItems = Array.isArray(data.events) ? data.events :
+                       (data.events?.items || []);
+
+    for (const item of eventItems.slice(-limit * 2)) {
+      try {
+        // Resolve event ref if needed
+        let eventData = item;
+        if (item.$ref) {
+          const eResp = await espnClient.get(item.$ref);
+          eventData = eResp.data;
+        }
+        const eventId = eventData.id || item.id;
+        const stats = {};
+
+        // Get athlete stats from this event
+        if (item.statistics) {
+          const statRef = item.statistics.$ref || item.statistics;
+          if (typeof statRef === 'string') {
+            try {
+              const statResp = await espnClient.get(statRef);
+              const splits = statResp.data?.splits?.categories || [];
+              splits.forEach(cat => {
+                (cat.stats || []).forEach(st => { stats[st.abbreviation || st.name] = st.value; });
+              });
+            } catch(e) {}
+          }
+        }
+
+        // Get game info
+        let date = '', opponent = '—', homeAway = '', result = '';
+        if (eventData.date) date = eventData.date;
+        if (eventData.competitions) {
+          const comp = eventData.competitions[0];
+          const opp = comp?.competitors?.find(c => !c.team?.id || c.homeAway);
+          homeAway = comp?.competitors?.find(c => c.id === id)?.homeAway || '';
+          result = comp?.status?.type?.completed ? (comp.competitors?.find(c=>c.winner)?.abbreviation || '—') : '—';
+        }
+
+        if (Object.keys(stats).length > 0) {
+          games.push({ eventId, date, opponent, homeAway, result, stats });
+        }
+      } catch(e) { continue; }
+    }
+
+    // Alternative simpler approach — use site web API
+    if (games.length === 0) {
+      try {
+        const url2 = `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/gamelog`;
+        const { data: d2 } = await espnClient.get(url2);
+        const cats = d2.categories || [];
+        const seasonTypes = d2.seasonTypes || [];
+
+        // Collect events from all season types
+        const allEvents = {};
+        seasonTypes.forEach(st => {
+          (st.categories || []).forEach(cat => {
+            (cat.events || []).forEach(ev => {
+              if (!allEvents[ev.eventId]) allEvents[ev.eventId] = { eventId: ev.eventId, stats: {} };
+              (cat.labels || []).forEach((lbl, i) => {
+                allEvents[ev.eventId].stats[lbl] = ev.stats?.[i] ?? null;
+              });
+            });
+          });
+        });
+
+        // Enrich with event metadata
+        const evMeta = d2.events || {};
+        Object.values(allEvents).forEach(ev => {
+          const meta = evMeta[ev.eventId] || {};
+          ev.date = meta.gameDate || '';
+          ev.opponent = meta.opponent?.abbreviation || meta.opponent?.displayName || '—';
+          ev.homeAway = meta.homeAway || '';
+          ev.result = meta.gameResult || '';
+        });
+
+        const sorted = Object.values(allEvents)
+          .filter(ev => Object.values(ev.stats).some(v => v !== null && v !== '0' && v !== 0))
+          .slice(-limit);
+
+        if (sorted.length > 0) {
+          const result = { games: sorted.reverse() };
+          caches.stats.set(cacheKey, result);
+          return res.json({ ...result, fromCache: false });
+        }
+      } catch(e2) {
+        console.error('[Gamelog] fallback failed:', e2.message);
+      }
+    }
+
+    const result = { games: games.slice(-limit).reverse() };
     caches.stats.set(cacheKey, result);
     res.json({ ...result, fromCache: false });
   } catch (err) {
-    // Fallback — try alternate ESPN endpoint
-    try {
-      const url2 = `https://site.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/gamelog`;
-      const { data: data2 } = await espnClient.get(url2);
-      const games2 = [];
-      const evts = data2.events || {};
-      const cats = data2.categories || [];
-      Object.entries(evts).slice(-limit).forEach(([eid, ev]) => {
-        const gs = {};
-        cats.forEach(cat => {
-          const e = (cat.events || []).find(x => x.eventId === eid);
-          if (!e) return;
-          (cat.labels || []).forEach((lbl, i) => { gs[lbl] = e.stats?.[i] ?? '—'; });
-        });
-        games2.push({ eventId: eid, date: ev.gameDate, opponent: ev.opponent?.displayName || '—', homeAway: ev.homeAway, result: ev.gameResult, stats: gs });
-      });
-      res.json({ games: games2.reverse(), fromCache: false });
-    } catch (err2) {
-      res.json({ games: [], error: err2.message });
-    }
+    console.error('[Gamelog] error:', err.message);
+    res.json({ games: [], error: err.message });
   }
 });
 
