@@ -825,40 +825,46 @@ app.get("/api/sports/:sport/athletes/:id/gamelog", async (req, res) => {
       try {
         const url2 = `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/gamelog`;
         const { data: d2 } = await espnClient.get(url2);
-        const cats = d2.categories || [];
         const seasonTypes = d2.seasonTypes || [];
+        const evMeta = d2.events?.events || d2.events || {};
 
-        // Collect events from all season types
+        // Build map: eventId -> { stats: {label: value} }
         const allEvents = {};
         seasonTypes.forEach(st => {
           (st.categories || []).forEach(cat => {
+            const labels = cat.labels || cat.names || [];
             (cat.events || []).forEach(ev => {
-              if (!allEvents[ev.eventId]) allEvents[ev.eventId] = { eventId: ev.eventId, stats: {} };
-              (cat.labels || []).forEach((lbl, i) => {
-                allEvents[ev.eventId].stats[lbl] = ev.stats?.[i] ?? null;
+              const eid = ev.eventId || ev.id;
+              if (!eid) return;
+              if (!allEvents[eid]) allEvents[eid] = { eventId: eid, stats: {} };
+              (labels).forEach((lbl, i) => {
+                const val = ev.stats?.[i];
+                if (val !== undefined && val !== null && val !== '' ) {
+                  allEvents[eid].stats[lbl] = val;
+                }
               });
             });
           });
         });
 
-        // Enrich with event metadata
-        const evMeta = d2.events || {};
+        // Enrich with event metadata (opponent, date, result)
+        const metaMap = typeof evMeta === 'object' && !Array.isArray(evMeta) ? evMeta : {};
         Object.values(allEvents).forEach(ev => {
-          const meta = evMeta[ev.eventId] || {};
-          ev.date = meta.gameDate || '';
-          ev.opponent = meta.opponent?.abbreviation || meta.opponent?.displayName || '—';
+          const meta = metaMap[ev.eventId] || {};
+          ev.date = meta.gameDate || meta.date || '';
+          ev.opponent = meta.opponent?.abbreviation || meta.opponent?.displayName || meta.atVs || '—';
           ev.homeAway = meta.homeAway || '';
-          ev.result = meta.gameResult || '';
+          ev.result = meta.gameResult || meta.result || '';
         });
 
         const sorted = Object.values(allEvents)
-          .filter(ev => Object.values(ev.stats).some(v => v !== null && v !== '0' && v !== 0))
+          .sort((a, b) => new Date(a.date) - new Date(b.date))
           .slice(-limit);
 
         if (sorted.length > 0) {
-          const result = { games: sorted.reverse() };
-          caches.stats.set(cacheKey, result);
-          return res.json({ ...result, fromCache: false });
+          const result2 = { games: sorted.reverse() };
+          caches.stats.set(cacheKey, result2);
+          return res.json({ ...result2, fromCache: false });
         }
       } catch(e2) {
         console.error('[Gamelog] fallback failed:', e2.message);
@@ -872,6 +878,27 @@ app.get("/api/sports/:sport/athletes/:id/gamelog", async (req, res) => {
     console.error('[Gamelog] error:', err.message);
     res.json({ games: [], error: err.message });
   }
+});
+
+// Gamelog debug — see raw ESPN response structure
+app.get("/api/debug/gamelog/:sport/:id", async (req, res) => {
+  const { sport, id } = req.params;
+  const { sport: s, league: l } = SPORTS[sport] || {};
+  if (!s) return res.status(400).json({ error: 'Invalid sport' });
+  try {
+    const url = `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/gamelog`;
+    const { data } = await espnClient.get(url);
+    const seasonTypes = data.seasonTypes || [];
+    const sample = seasonTypes[0]?.categories?.[0];
+    res.json({
+      seasonTypeCount: seasonTypes.length,
+      firstCategoryLabels: sample?.labels || sample?.names || [],
+      firstCategoryEventCount: sample?.events?.length || 0,
+      firstEvent: sample?.events?.[0] || null,
+      eventKeys: Object.keys(data.events || {}),
+      firstEventMeta: Object.values(data.events || {})[0] || null
+    });
+  } catch(e) { res.json({ error: e.message }); }
 });
 
 app.get("/api/debug/:sport/:id", async (req, res) => {
