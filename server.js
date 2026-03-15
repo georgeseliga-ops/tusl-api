@@ -819,21 +819,25 @@ app.get("/api/draft/:sport/session", async (req, res) => {
 
     // Check if current nomination timer expired — auto-close it
     if (nomination && nomination.bid_ends_at && new Date(nomination.bid_ends_at) < new Date()) {
+      nomination.sport = sport;
       await closNomination(session.id, nomination, pool);
       nomination = null;
-      // Advance nominator
-      const nextIdx = (session.current_nominator_idx + 1) % JSON.parse(session.nomination_order).length;
+      const order = typeof session.nomination_order === 'string' ? JSON.parse(session.nomination_order) : session.nomination_order;
+      const nextIdx = (session.current_nominator_idx + 1) % order.length;
       await pool.query("UPDATE draft_sessions SET current_nominator_idx = $1 WHERE id = $2", [nextIdx, session.id]);
     }
 
     res.json({
-      session: { ...session, nomination_order: JSON.parse(session.nomination_order) },
+      session: { ...session, nomination_order: typeof session.nomination_order === 'string' ? JSON.parse(session.nomination_order) : session.nomination_order },
       nomination,
       results: results.rows,
       budgetMap,
       serverTime: new Date().toISOString()
     });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) {
+    console.error('[Draft] Session error:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Close a nomination and record winner
@@ -901,7 +905,7 @@ app.post("/api/draft/:sport/nominate", authRequired, async (req, res) => {
     );
     if (session.rows.length === 0) return res.status(400).json({ error: 'No active draft session' });
     const s = session.rows[0];
-    const order = JSON.parse(s.nomination_order);
+    const order = typeof s.nomination_order === "string" ? JSON.parse(s.nomination_order) : s.nomination_order;
     const currentNominator = order[s.current_nominator_idx];
     if (currentNominator !== req.user.teamId) {
       return res.status(403).json({ error: `It's not your turn to nominate` });
@@ -1004,7 +1008,7 @@ app.post("/api/draft/:sport/close-nomination", authRequired, async (req, res) =>
     await closNomination(s.id, nomination, pool);
 
     // Advance nominator
-    const order = JSON.parse(s.nomination_order);
+    const order = typeof s.nomination_order === "string" ? JSON.parse(s.nomination_order) : s.nomination_order;
     const nextIdx = (s.current_nominator_idx + 1) % order.length;
     await pool.query("UPDATE draft_sessions SET current_nominator_idx = $1 WHERE id = $2", [nextIdx, s.id]);
 
