@@ -366,7 +366,8 @@ app.get("/api/freeagents/:sport", async (req, res) => {
       return true;
     });
 
-    res.json({ sport, freeAgents: freeAgents.slice(0, 50), total: freeAgents.length });
+    (let i = freeAgents.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [freeAgents[i], freeAgents[j]] = [freeAgents[j], freeAgents[i]]; }
+res.json({ sport, freeAgents: freeAgents.slice(0, 200), total: freeAgents.length });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
