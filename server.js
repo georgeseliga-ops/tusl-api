@@ -12,6 +12,12 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "tusl-secret-change-in-production";
 
 app.use(cors());
+// Ensure CORS headers are always present, even on errors
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  next();
+});
 app.use(express.json());
 
 // ── Database ──────────────────────────────────────────────────────────────
@@ -20,7 +26,6 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes("railway") ? { rejectUnauthorized: false } : false,
 });
 
-// Initialize schema on startup
 async function initDB() {
   try {
     await pool.query(`
@@ -81,11 +86,12 @@ async function initDB() {
 
 // ── Cache ─────────────────────────────────────────────────────────────────
 const caches = {
-  live:     new NodeCache({ stdTTL: 20 }),
-  standings:new NodeCache({ stdTTL: 300 }),
-  teams:    new NodeCache({ stdTTL: 86400 }),
-  stats:    new NodeCache({ stdTTL: 60 }),
-  search:   new NodeCache({ stdTTL: 604800 }),
+  live:      new NodeCache({ stdTTL: 20 }),
+  standings: new NodeCache({ stdTTL: 300 }),
+  teams:     new NodeCache({ stdTTL: 86400 }),
+  stats:     new NodeCache({ stdTTL: 60 }),
+  search:    new NodeCache({ stdTTL: 604800 }),
+  freeagents:new NodeCache({ stdTTL: 3600 }), // Cache FA lists for 1 hour
 };
 
 async function getOrFetch(type, key, fetchFn) {
@@ -99,6 +105,7 @@ async function getOrFetch(type, key, fetchFn) {
 
 // ── ESPN Client ───────────────────────────────────────────────────────────
 const espnClient = axios.create({
+  timeout: 10000,
   headers: {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -209,36 +216,43 @@ async function getAthleteStats(sport, athleteId) {
 }
 
 // ── Free Agent Search ─────────────────────────────────────────────────────
-// Returns players on current rosters who aren't in any T.U.S.L. team
+// Fetches ALL team rosters in PARALLEL — fast!
 async function getFreeAgents(sport, position) {
   const {sport:s,league:l}=SPORTS[sport];
   const teamsData = await getTeams(sport);
   const allPlayers = [];
 
-  for(const team of teamsData.teams) {
-    try{
-      const {data}=await espnClient.get(`${ESPN}/${s}/${l}/teams/${team.id}/roster`);
-      const players=(data.athletes||[]).flatMap(g=>(g.items||g.athletes||[g])).filter(p=>p?.id);
-      players.forEach(p => {
-        const pos = p.position?.abbreviation || "";
-        if (!position || pos === position || pos.includes(position)) {
-          allPlayers.push({
-            id: p.id,
-            name: p.fullName || p.displayName,
-            position: pos,
-            team: team.abbreviation,
-            teamName: team.name,
-          });
-        }
-      });
-    } catch(e){}
-  }
+  // Fire all team roster requests simultaneously instead of one-by-one
+  const results = await Promise.allSettled(
+    teamsData.teams.map(team =>
+      espnClient.get(`${ESPN}/${s}/${l}/teams/${team.id}/roster`)
+        .then(({ data }) => ({ team, data }))
+    )
+  );
+
+  results.forEach(result => {
+    if (result.status !== 'fulfilled') return;
+    const { team, data } = result.value;
+    const players = (data.athletes||[]).flatMap(g=>(g.items||g.athletes||[g])).filter(p=>p?.id);
+    players.forEach(p => {
+      const pos = p.position?.abbreviation || "";
+      if (!position || pos === position || pos.includes(position)) {
+        allPlayers.push({
+          id: p.id,
+          name: p.fullName || p.displayName,
+          position: pos,
+          team: team.abbreviation,
+          teamName: team.name,
+        });
+      }
+    });
+  });
+
   return allPlayers;
 }
 
 // ── Auth Routes ───────────────────────────────────────────────────────────
 
-// Register new team owner
 app.post("/api/auth/register", async (req, res) => {
   const { teamId, teamName, ownerName, email, password } = req.body;
   if (!teamId || !email || !password || !ownerName) {
@@ -253,14 +267,13 @@ app.post("/api/auth/register", async (req, res) => {
     );
     const user = result.rows[0];
     const token = jwt.sign({ userId: user.id, teamId: user.team_id, teamName: user.team_name }, JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user });
+    res.json({ token, user: { id: user.id, teamId: user.team_id, teamName: user.team_name, ownerName: user.owner_name, email: user.email, faabBalance: user.faab_balance } });
   } catch(err) {
     if (err.code === "23505") return res.status(400).json({ error: "Email or team already registered" });
     res.status(500).json({ error: err.message });
   }
 });
 
-// Login
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
@@ -277,7 +290,6 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// Get current user
 app.get("/api/auth/me", authRequired, async (req, res) => {
   try {
     const result = await pool.query("SELECT id, team_id, team_name, owner_name, email, faab_balance FROM users WHERE id = $1", [req.user.userId]);
@@ -289,7 +301,6 @@ app.get("/api/auth/me", authRequired, async (req, res) => {
 
 // ── Roster Routes ─────────────────────────────────────────────────────────
 
-// Get team roster from DB
 app.get("/api/roster/:teamId", authRequired, async (req, res) => {
   const { teamId } = req.params;
   if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Can only view your own roster" });
@@ -304,9 +315,8 @@ app.get("/api/roster/:teamId", authRequired, async (req, res) => {
   }
 });
 
-// Move player to/from IR
 app.post("/api/roster/ir-move", authRequired, async (req, res) => {
-  const { playerName, sport, direction } = req.body; // direction: "to-ir" | "from-ir"
+  const { playerName, sport, direction } = req.body;
   if (!playerName || !sport || !direction) return res.status(400).json({ error: "playerName, sport, direction required" });
   try {
     const newSlot = direction === "to-ir" ? "ir" : "active";
@@ -324,7 +334,6 @@ app.post("/api/roster/ir-move", authRequired, async (req, res) => {
   }
 });
 
-// Drop player
 app.post("/api/roster/drop", authRequired, async (req, res) => {
   const { playerName, sport } = req.body;
   if (!playerName || !sport) return res.status(400).json({ error: "playerName and sport required" });
@@ -345,48 +354,59 @@ app.post("/api/roster/drop", authRequired, async (req, res) => {
 
 // ── Waiver / Free Agent Routes ─────────────────────────────────────────────
 
-// Browse free agents by sport
 app.get("/api/freeagents/:sport", async (req, res) => {
   const { sport } = req.params;
   const { position, search } = req.query;
   if (!SPORTS[sport]) return res.status(400).json({ error: "Invalid sport" });
   try {
-    // Get all rostered players in T.U.S.L.
+    // Check cache first (1 hour TTL)
+    const cacheKey = `fa_${sport}_${position||'all'}`;
+    const cached = caches.freeagents.get(cacheKey);
+    if (cached && !search) {
+      // Apply search filter on cached results if needed
+      return res.json(cached);
+    }
+
     const rostered = await pool.query("SELECT player_name FROM rosters WHERE sport = $1", [sport]);
     const rosteredNames = new Set(rostered.rows.map(r => r.player_name.toLowerCase()));
 
-    // Get all players from ESPN rosters
     const allPlayers = await getFreeAgents(sport, position);
 
-    // Filter: not in any T.U.S.L. roster, optionally search by name
-    const freeAgents = allPlayers.filter(p => {
+    let freeAgents = allPlayers.filter(p => {
       const name = (p.name||"").toLowerCase();
       if (rosteredNames.has(name)) return false;
       if (search && !name.includes(search.toLowerCase())) return false;
       return true;
     });
 
-    (let i = freeAgents.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [freeAgents[i], freeAgents[j]] = [freeAgents[j], freeAgents[i]]; }
-res.json({ sport, freeAgents: freeAgents.slice(0, 200), total: freeAgents.length });
+    // Shuffle so results aren't always alphabetically team-biased
+    for (let i = freeAgents.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [freeAgents[i], freeAgents[j]] = [freeAgents[j], freeAgents[i]];
+    }
+
+    const result = { sport, freeAgents: freeAgents.slice(0, 200), total: freeAgents.length };
+
+    // Cache if no search filter applied
+    if (!search) caches.freeagents.set(cacheKey, result);
+
+    res.json(result);
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Submit FAAB waiver bid
 app.post("/api/waivers/bid", authRequired, async (req, res) => {
   const { playerName, sport, bidAmount, dropPlayer } = req.body;
   if (!playerName || !sport || bidAmount === undefined) {
     return res.status(400).json({ error: "playerName, sport, bidAmount required" });
   }
   try {
-    // Check FAAB balance
     const userResult = await pool.query("SELECT faab_balance FROM users WHERE id = $1", [req.user.userId]);
     const balance = userResult.rows[0]?.faab_balance || 0;
     if (bidAmount > balance) return res.status(400).json({ error: `Insufficient FAAB. Balance: $${balance}` });
     if (bidAmount < 0) return res.status(400).json({ error: "Bid must be $0 or more" });
 
-    // Check for existing bid on this player
     await pool.query(
       `INSERT INTO waiver_bids (team_id, sport, player_name, bid_amount, drop_player)
        VALUES ($1, $2, $3, $4, $5)
@@ -399,7 +419,6 @@ app.post("/api/waivers/bid", authRequired, async (req, res) => {
   }
 });
 
-// Get my pending bids
 app.get("/api/waivers/my-bids", authRequired, async (req, res) => {
   try {
     const result = await pool.query(
@@ -412,7 +431,6 @@ app.get("/api/waivers/my-bids", authRequired, async (req, res) => {
   }
 });
 
-// Cancel a bid
 app.delete("/api/waivers/bid/:bidId", authRequired, async (req, res) => {
   try {
     await pool.query(
@@ -425,7 +443,6 @@ app.delete("/api/waivers/bid/:bidId", authRequired, async (req, res) => {
   }
 });
 
-// Get transaction log
 app.get("/api/transactions/:teamId", authRequired, async (req, res) => {
   const { teamId } = req.params;
   if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Can only view your own transactions" });
@@ -529,7 +546,6 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
 
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
 
-// Start
 async function start() {
   await initDB();
   app.listen(PORT, () => console.log(`\n🏆 T.U.S.L. API v5 running on port ${PORT}\n`));
