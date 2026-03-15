@@ -419,7 +419,84 @@ app.post("/api/waivers/bid", authRequired, async (req, res) => {
   }
 });
 
-app.get("/api/waivers/my-bids", authRequired, async (req, res) => {
+// Instant claim — add player immediately, optionally drop one, deduct FAAB
+app.post("/api/waivers/claim", authRequired, async (req, res) => {
+  const { playerName, sport, position, bidAmount, dropPlayer, espnId } = req.body;
+  if (!playerName || !sport || bidAmount === undefined) {
+    return res.status(400).json({ error: "playerName, sport, bidAmount required" });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Check FAAB balance
+    const userResult = await client.query("SELECT faab_balance FROM users WHERE id = $1 FOR UPDATE", [req.user.userId]);
+    const balance = userResult.rows[0]?.faab_balance ?? 0;
+    if (bidAmount > balance) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: `Insufficient FAAB. Balance: $${balance}` });
+    }
+    if (bidAmount < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Bid must be $0 or more" });
+    }
+
+    // Drop player if specified
+    if (dropPlayer) {
+      await client.query(
+        "DELETE FROM rosters WHERE team_id = $1 AND sport = $2 AND player_name = $3",
+        [req.user.teamId, sport, dropPlayer]
+      );
+      await client.query(
+        "INSERT INTO transactions (team_id, type, sport, player_out, faab_spent) VALUES ($1, $2, $3, $4, $5)",
+        [req.user.teamId, "drop", sport, dropPlayer, 0]
+      );
+    }
+
+    // Add player to roster
+    await client.query(
+      `INSERT INTO rosters (team_id, sport, player_name, player_espn_id, position, slot, auction_price)
+       VALUES ($1, $2, $3, $4, $5, 'active', $6)
+       ON CONFLICT (team_id, sport, player_name) DO UPDATE SET slot = 'active'`,
+      [req.user.teamId, sport, playerName, espnId || null, position || 'UTIL', bidAmount]
+    );
+
+    // Deduct FAAB
+    await client.query(
+      "UPDATE users SET faab_balance = faab_balance - $1 WHERE id = $2",
+      [bidAmount, req.user.userId]
+    );
+
+    // Log transaction
+    await client.query(
+      "INSERT INTO transactions (team_id, type, sport, player_in, player_out, faab_spent) VALUES ($1, $2, $3, $4, $5, $6)",
+      [req.user.teamId, "claim", sport, playerName, dropPlayer || null, bidAmount]
+    );
+
+    // Mark any pending bid on this player as processed
+    await client.query(
+      "UPDATE waiver_bids SET status = 'processed', processed_at = NOW() WHERE team_id = $1 AND sport = $2 AND player_name = $3 AND status = 'pending'",
+      [req.user.teamId, sport, playerName]
+    );
+
+    await client.query("COMMIT");
+
+    const updatedUser = await pool.query("SELECT faab_balance FROM users WHERE id = $1", [req.user.userId]);
+    res.json({
+      success: true,
+      message: `${playerName} added to your roster!`,
+      newFaabBalance: updatedUser.rows[0].faab_balance
+    });
+  } catch(err) {
+    await client.query("ROLLBACK");
+    if (err.code === "23505") {
+      return res.status(400).json({ error: `${playerName} is already on your roster` });
+    }
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
   try {
     const result = await pool.query(
       "SELECT * FROM waiver_bids WHERE team_id = $1 AND status = 'pending' ORDER BY created_at DESC",
