@@ -357,6 +357,8 @@ app.post("/api/roster/drop", authRequired, async (req, res) => {
       "INSERT INTO transactions (team_id, type, sport, player_out) VALUES ($1, $2, $3, $4)",
       [req.user.teamId, "drop", sport, playerName]
     );
+    // Bust FA cache so dropped player reappears
+    caches.freeagents.del(`fa_${sport}_all`);
     res.json({ success: true, dropped: playerName });
   } catch(err) {
     res.status(500).json({ error: err.message });
@@ -506,6 +508,12 @@ app.post("/api/waivers/claim", authRequired, async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    // Bust FA cache for this sport so the claimed player disappears immediately
+    caches.freeagents.del(`fa_${sport}_all`);
+    ['IF','OF','SP','RP','QB','RB','WR','TE','G','F','C','D','FORWARD'].forEach(pos => {
+        caches.freeagents.del(`fa_${sport}_${pos}`);
+    });
 
     const updatedUser = await pool.query("SELECT faab_balance FROM users WHERE id = $1", [req.user.userId]);
     res.json({
