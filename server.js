@@ -781,7 +781,7 @@ app.get("/api/draft/:sport/session", async (req, res) => {
       // Create new session
       const order = [1,2,3,4,5,6,7,8,9,10]; // team IDs 1-10
       result = await pool.query(
-        "INSERT INTO draft_sessions (sport, status, nomination_order) VALUES ($1, 'waiting', $2) RETURNING *",
+        "INSERT INTO draft_sessions (sport, status, nomination_order, commissioner_team_id) VALUES ($1, 'waiting', $2, 9) RETURNING *",
         [sport, JSON.stringify(order)]
       );
     }
