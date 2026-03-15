@@ -497,6 +497,8 @@ app.post("/api/waivers/claim", authRequired, async (req, res) => {
     client.release();
   }
 });
+
+app.get("/api/waivers/my-bids", authRequired, async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM waiver_bids WHERE team_id = $1 AND status = 'pending' ORDER BY created_at DESC",
