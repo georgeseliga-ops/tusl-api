@@ -88,6 +88,54 @@ async function initDB() {
         acquired_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(team_id, sport, player_name)
       );
+
+      CREATE TABLE IF NOT EXISTS draft_sessions (
+        id SERIAL PRIMARY KEY,
+        sport VARCHAR(10) NOT NULL,
+        status VARCHAR(20) DEFAULT 'waiting',
+        commissioner_team_id INTEGER,
+        nomination_order JSONB DEFAULT '[]',
+        current_nominator_idx INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        started_at TIMESTAMP,
+        completed_at TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS draft_nominations (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        nominating_team_id INTEGER NOT NULL,
+        player_name VARCHAR(100) NOT NULL,
+        player_espn_id VARCHAR(20),
+        position VARCHAR(10),
+        min_bid INTEGER DEFAULT 1,
+        status VARCHAR(20) DEFAULT 'active',
+        winning_team_id INTEGER,
+        winning_bid INTEGER,
+        bid_ends_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS draft_bids (
+        id SERIAL PRIMARY KEY,
+        nomination_id INTEGER NOT NULL,
+        session_id INTEGER NOT NULL,
+        team_id INTEGER NOT NULL,
+        bid_amount INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS draft_results (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        sport VARCHAR(10) NOT NULL,
+        team_id INTEGER NOT NULL,
+        player_name VARCHAR(100) NOT NULL,
+        player_espn_id VARCHAR(20),
+        position VARCHAR(10),
+        winning_bid INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
     `);
     console.log("✓ Database schema initialized");
   } catch(err) {
@@ -712,6 +760,280 @@ app.get("/api/debug/:sport/:id",async(req,res)=>{
     }catch(e){continue;}
   }
   res.json({error:"both years failed",sport,id});
+});
+
+// ── Draft Routes ──────────────────────────────────────────────────────────
+
+const DRAFT_ROSTER_SLOTS = {
+  mlb: ['Infielder 1','Infielder 2','Outfielder 1','Outfielder 2','UTIL','Pitcher 1','Pitcher 2','Relief Pitcher'],
+  nfl: ['QB','RB 1','RB 2','WR 1','WR 2','TE']
+};
+
+// Get or create draft session for a sport
+app.get("/api/draft/:sport/session", async (req, res) => {
+  const { sport } = req.params;
+  try {
+    let result = await pool.query(
+      "SELECT * FROM draft_sessions WHERE sport = $1 AND status != 'completed' ORDER BY created_at DESC LIMIT 1",
+      [sport]
+    );
+    if (result.rows.length === 0) {
+      // Create new session
+      const order = [1,2,3,4,5,6,7,8,9,10]; // team IDs 1-10
+      result = await pool.query(
+        "INSERT INTO draft_sessions (sport, status, nomination_order) VALUES ($1, 'waiting', $2) RETURNING *",
+        [sport, JSON.stringify(order)]
+      );
+    }
+    const session = result.rows[0];
+    // Get current nomination if active
+    let nomination = null;
+    if (session.status === 'active') {
+      const nomResult = await pool.query(
+        "SELECT n.*, u.team_name as nominator_name FROM draft_nominations n JOIN users u ON u.team_id = n.nominating_team_id WHERE n.session_id = $1 AND n.status = 'active' ORDER BY n.created_at DESC LIMIT 1",
+        [session.id]
+      );
+      if (nomResult.rows.length > 0) {
+        nomination = nomResult.rows[0];
+        // Get all bids for this nomination
+        const bidsResult = await pool.query(
+          "SELECT b.*, u.team_name FROM draft_bids b JOIN users u ON u.team_id = b.team_id WHERE b.nomination_id = $1 ORDER BY b.bid_amount DESC",
+          [nomination.id]
+        );
+        nomination.bids = bidsResult.rows;
+        nomination.top_bid = bidsResult.rows[0] || null;
+      }
+    }
+    // Get draft results so far
+    const results = await pool.query(
+      "SELECT dr.*, u.team_name FROM draft_results dr JOIN users u ON u.team_id = dr.team_id WHERE dr.session_id = $1 ORDER BY dr.created_at DESC",
+      [session.id]
+    );
+    // Get team budgets spent in this draft
+    const budgets = await pool.query(
+      "SELECT team_id, SUM(winning_bid) as spent FROM draft_results WHERE session_id = $1 GROUP BY team_id",
+      [session.id]
+    );
+    const budgetMap = {};
+    budgets.rows.forEach(b => { budgetMap[b.team_id] = parseInt(b.spent) || 0; });
+
+    // Check if current nomination timer expired — auto-close it
+    if (nomination && nomination.bid_ends_at && new Date(nomination.bid_ends_at) < new Date()) {
+      await closNomination(session.id, nomination, pool);
+      nomination = null;
+      // Advance nominator
+      const nextIdx = (session.current_nominator_idx + 1) % JSON.parse(session.nomination_order).length;
+      await pool.query("UPDATE draft_sessions SET current_nominator_idx = $1 WHERE id = $2", [nextIdx, session.id]);
+    }
+
+    res.json({
+      session: { ...session, nomination_order: JSON.parse(session.nomination_order) },
+      nomination,
+      results: results.rows,
+      budgetMap,
+      serverTime: new Date().toISOString()
+    });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Close a nomination and record winner
+async function closNomination(sessionId, nomination, poolClient) {
+  const client = poolClient || pool;
+  const topBid = nomination.top_bid || nomination.bids?.[0];
+  if (!topBid) {
+    // No bids — mark as no_bid
+    await client.query("UPDATE draft_nominations SET status = 'no_bid' WHERE id = $1", [nomination.id]);
+    return;
+  }
+  // Record result
+  await client.query(
+    "INSERT INTO draft_results (session_id, sport, team_id, player_name, player_espn_id, position, winning_bid) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+    [sessionId, nomination.sport || 'mlb', topBid.team_id, nomination.player_name, nomination.player_espn_id, nomination.position, topBid.bid_amount]
+  );
+  // Mark nomination closed
+  await client.query(
+    "UPDATE draft_nominations SET status = 'closed', winning_team_id = $1, winning_bid = $2 WHERE id = $3",
+    [topBid.team_id, topBid.bid_amount, nomination.id]
+  );
+  // Add to rosters table
+  await client.query(
+    `INSERT INTO rosters (team_id, sport, player_name, player_espn_id, position, slot, auction_price)
+     VALUES ($1, $2, $3, $4, $5, 'active', $6) ON CONFLICT (team_id, sport, player_name) DO NOTHING`,
+    [topBid.team_id, nomination.sport || 'mlb', nomination.player_name, nomination.player_espn_id, nomination.position || 'UTIL', topBid.bid_amount]
+  );
+}
+
+// Start draft session (commissioner only)
+app.post("/api/draft/:sport/start", authRequired, async (req, res) => {
+  const { sport } = req.params;
+  try {
+    const result = await pool.query(
+      "UPDATE draft_sessions SET status = 'active', commissioner_team_id = $1, started_at = NOW() WHERE sport = $2 AND status = 'waiting' RETURNING *",
+      [req.user.teamId, sport]
+    );
+    if (result.rows.length === 0) return res.status(400).json({ error: 'No waiting session found' });
+    res.json({ success: true, session: result.rows[0] });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Pause/resume draft
+app.post("/api/draft/:sport/pause", authRequired, async (req, res) => {
+  const { sport } = req.params;
+  const { action } = req.body; // 'pause' | 'resume'
+  try {
+    const newStatus = action === 'pause' ? 'paused' : 'active';
+    await pool.query(
+      "UPDATE draft_sessions SET status = $1 WHERE sport = $2 AND status != 'completed'",
+      [newStatus, sport]
+    );
+    res.json({ success: true, status: newStatus });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Nominate a player
+app.post("/api/draft/:sport/nominate", authRequired, async (req, res) => {
+  const { sport } = req.params;
+  const { playerName, espnId, position, minBid } = req.body;
+  if (!playerName) return res.status(400).json({ error: 'playerName required' });
+  try {
+    const session = await pool.query(
+      "SELECT * FROM draft_sessions WHERE sport = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1", [sport]
+    );
+    if (session.rows.length === 0) return res.status(400).json({ error: 'No active draft session' });
+    const s = session.rows[0];
+    const order = JSON.parse(s.nomination_order);
+    const currentNominator = order[s.current_nominator_idx];
+    if (currentNominator !== req.user.teamId) {
+      return res.status(403).json({ error: `It's not your turn to nominate` });
+    }
+    // Check no active nomination already
+    const existing = await pool.query(
+      "SELECT id FROM draft_nominations WHERE session_id = $1 AND status = 'active'", [s.id]
+    );
+    if (existing.rows.length > 0) return res.status(400).json({ error: 'A player is already up for bid' });
+
+    // Check player not already drafted
+    const alreadyDrafted = await pool.query(
+      "SELECT id FROM draft_results WHERE session_id = $1 AND player_name ILIKE $2", [s.id, playerName]
+    );
+    if (alreadyDrafted.rows.length > 0) return res.status(400).json({ error: `${playerName} was already drafted` });
+
+    const bidEndsAt = new Date(Date.now() + 30000); // 30 second timer
+    const nom = await pool.query(
+      "INSERT INTO draft_nominations (session_id, nominating_team_id, player_name, player_espn_id, position, min_bid, bid_ends_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+      [s.id, req.user.teamId, playerName, espnId || null, position || 'UTIL', minBid || 1, bidEndsAt]
+    );
+    // Auto-place min bid from nominator
+    await pool.query(
+      "INSERT INTO draft_bids (nomination_id, session_id, team_id, bid_amount) VALUES ($1,$2,$3,$4)",
+      [nom.rows[0].id, s.id, req.user.teamId, minBid || 1]
+    );
+    res.json({ success: true, nomination: nom.rows[0] });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Place a bid
+app.post("/api/draft/:sport/bid", authRequired, async (req, res) => {
+  const { sport } = req.params;
+  const { nominationId, bidAmount } = req.body;
+  if (!nominationId || bidAmount === undefined) return res.status(400).json({ error: 'nominationId and bidAmount required' });
+  try {
+    const session = await pool.query(
+      "SELECT * FROM draft_sessions WHERE sport = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1", [sport]
+    );
+    if (session.rows.length === 0) return res.status(400).json({ error: 'No active draft session' });
+    const s = session.rows[0];
+
+    const nom = await pool.query("SELECT * FROM draft_nominations WHERE id = $1 AND status = 'active'", [nominationId]);
+    if (nom.rows.length === 0) return res.status(400).json({ error: 'Nomination not found or already closed' });
+    const nomination = nom.rows[0];
+    if (new Date(nomination.bid_ends_at) < new Date()) return res.status(400).json({ error: 'Bidding has ended' });
+
+    // Get current top bid
+    const topBid = await pool.query(
+      "SELECT MAX(bid_amount) as max_bid FROM draft_bids WHERE nomination_id = $1", [nominationId]
+    );
+    const currentMax = parseInt(topBid.rows[0].max_bid) || 0;
+    if (bidAmount <= currentMax) return res.status(400).json({ error: `Bid must be higher than current bid of $${currentMax}` });
+
+    // Check team budget
+    const spent = await pool.query(
+      "SELECT COALESCE(SUM(winning_bid),0) as spent FROM draft_results WHERE session_id = $1 AND team_id = $2",
+      [s.id, req.user.teamId]
+    );
+    const totalSpent = parseInt(spent.rows[0].spent) || 0;
+    if (totalSpent + bidAmount > 400) return res.status(400).json({ error: `Bid would exceed $400 budget (spent: $${totalSpent})` });
+
+    // Extend timer by 10s if bid in last 10s
+    const timeLeft = new Date(nomination.bid_ends_at) - new Date();
+    if (timeLeft < 10000) {
+      await pool.query("UPDATE draft_nominations SET bid_ends_at = NOW() + INTERVAL '10 seconds' WHERE id = $1", [nominationId]);
+    }
+
+    await pool.query(
+      "INSERT INTO draft_bids (nomination_id, session_id, team_id, bid_amount) VALUES ($1,$2,$3,$4)",
+      [nominationId, s.id, req.user.teamId, bidAmount]
+    );
+    res.json({ success: true, bid: bidAmount });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Close current nomination manually (commissioner or timer expired)
+app.post("/api/draft/:sport/close-nomination", authRequired, async (req, res) => {
+  const { sport } = req.params;
+  try {
+    const session = await pool.query(
+      "SELECT * FROM draft_sessions WHERE sport = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1", [sport]
+    );
+    if (session.rows.length === 0) return res.status(400).json({ error: 'No active session' });
+    const s = session.rows[0];
+
+    const nomResult = await pool.query(
+      "SELECT n.*, $2 as sport FROM draft_nominations n WHERE n.session_id = $1 AND n.status = 'active' ORDER BY n.created_at DESC LIMIT 1",
+      [s.id, sport]
+    );
+    if (nomResult.rows.length === 0) return res.status(400).json({ error: 'No active nomination' });
+    const nomination = nomResult.rows[0];
+    const bidsResult = await pool.query(
+      "SELECT * FROM draft_bids WHERE nomination_id = $1 ORDER BY bid_amount DESC LIMIT 1", [nomination.id]
+    );
+    nomination.bids = bidsResult.rows;
+    nomination.top_bid = bidsResult.rows[0] || null;
+    nomination.sport = sport;
+
+    await closNomination(s.id, nomination, pool);
+
+    // Advance nominator
+    const order = JSON.parse(s.nomination_order);
+    const nextIdx = (s.current_nominator_idx + 1) % order.length;
+    await pool.query("UPDATE draft_sessions SET current_nominator_idx = $1 WHERE id = $2", [nextIdx, s.id]);
+
+    res.json({ success: true, winner: nomination.top_bid });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Reset draft session
+app.post("/api/draft/:sport/reset", authRequired, async (req, res) => {
+  const { sport } = req.params;
+  try {
+    const session = await pool.query(
+      "SELECT id FROM draft_sessions WHERE sport = $1 ORDER BY created_at DESC LIMIT 1", [sport]
+    );
+    if (session.rows.length > 0) {
+      const sid = session.rows[0].id;
+      await pool.query("DELETE FROM draft_bids WHERE session_id = $1", [sid]);
+      await pool.query("DELETE FROM draft_nominations WHERE session_id = $1", [sid]);
+      await pool.query("DELETE FROM draft_results WHERE session_id = $1", [sid]);
+      await pool.query("DELETE FROM draft_sessions WHERE id = $1", [sid]);
+    }
+    // Create fresh session
+    const order = [1,2,3,4,5,6,7,8,9,10];
+    await pool.query(
+      "INSERT INTO draft_sessions (sport, status, nomination_order) VALUES ($1, 'waiting', $2)",
+      [sport, JSON.stringify(order)]
+    );
+    res.json({ success: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
 app.use((req,res)=>res.status(404).json({error:"Not found"}));
