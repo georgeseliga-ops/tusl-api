@@ -77,6 +77,17 @@ async function initDB() {
         processed_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS stat_snapshots (
+        id SERIAL PRIMARY KEY,
+        team_id INTEGER NOT NULL,
+        sport VARCHAR(10) NOT NULL,
+        player_name VARCHAR(100) NOT NULL,
+        player_espn_id VARCHAR(20),
+        snapshot_stats JSONB NOT NULL DEFAULT '{}',
+        acquired_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(team_id, sport, player_name)
+      );
     `);
     console.log("✓ Database schema initialized");
   } catch(err) {
@@ -461,6 +472,21 @@ app.post("/api/waivers/claim", authRequired, async (req, res) => {
       [req.user.teamId, sport, playerName, espnId || null, position || 'UTIL', bidAmount]
     );
 
+    // Capture stat snapshot at acquisition time (so only post-add stats count)
+    let snapshotStats = {};
+    if (espnId) {
+      try {
+        const statsResult = await getAthleteStats(sport, espnId);
+        snapshotStats = statsResult.stats || {};
+      } catch(e) { /* snapshot failure is non-fatal */ }
+    }
+    await client.query(
+      `INSERT INTO stat_snapshots (team_id, sport, player_name, player_espn_id, snapshot_stats)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (team_id, sport, player_name) DO UPDATE SET snapshot_stats = $5, acquired_at = NOW()`,
+      [req.user.teamId, sport, playerName, espnId || null, JSON.stringify(snapshotStats)]
+    );
+
     // Deduct FAAB
     await client.query(
       "UPDATE users SET faab_balance = faab_balance - $1 WHERE id = $2",
@@ -495,6 +521,63 @@ app.post("/api/waivers/claim", authRequired, async (req, res) => {
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
+  }
+});
+
+// Backfill snapshots for already-claimed players (one-time use per player)
+app.post("/api/snapshots/backfill", authRequired, async (req, res) => {
+  try {
+    const roster = await pool.query(
+      "SELECT player_name, player_espn_id, sport FROM rosters WHERE team_id = $1",
+      [req.user.teamId]
+    );
+    const existing = await pool.query(
+      "SELECT player_name, sport FROM stat_snapshots WHERE team_id = $1",
+      [req.user.teamId]
+    );
+    const existingKeys = new Set(existing.rows.map(r => `${r.sport}_${r.player_name}`));
+    const missing = roster.rows.filter(r => !existingKeys.has(`${r.sport}_${r.player_name}`));
+    
+    let filled = 0;
+    for (const p of missing) {
+      if (!p.player_espn_id) continue;
+      try {
+        const statsResult = await getAthleteStats(p.sport, p.player_espn_id);
+        await pool.query(
+          `INSERT INTO stat_snapshots (team_id, sport, player_name, player_espn_id, snapshot_stats)
+           VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
+          [req.user.teamId, p.sport, p.player_name, p.player_espn_id, JSON.stringify(statsResult.stats || {})]
+        );
+        filled++;
+      } catch(e) {}
+    }
+    res.json({ success: true, filled, message: `Backfilled ${filled} player snapshots` });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get stat snapshots for a team (for post-acquisition stat calculation)
+app.get("/api/snapshots/:teamId", authRequired, async (req, res) => {
+  const { teamId } = req.params;
+  if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Can only view your own snapshots" });
+  try {
+    const result = await pool.query(
+      "SELECT sport, player_name, player_espn_id, snapshot_stats, acquired_at FROM stat_snapshots WHERE team_id = $1",
+      [teamId]
+    );
+    // Return as a lookup map: { 'nhl_Lane Hutson': { stats: {...}, acquiredAt: '...' } }
+    const snapshots = {};
+    result.rows.forEach(row => {
+      snapshots[`${row.sport}_${row.player_name}`] = {
+        stats: row.snapshot_stats,
+        espnId: row.player_espn_id,
+        acquiredAt: row.acquired_at
+      };
+    });
+    res.json({ snapshots });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
