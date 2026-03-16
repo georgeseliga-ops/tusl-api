@@ -860,6 +860,25 @@ app.get("/api/sports/:sport/athletes/:id/gamelog", async (req, res) => {
 });
 
 // Raw ESPN gamelog passthrough — shows exact structure for debugging
+// Headshot proxy — serves ESPN player images through our server to avoid CORS
+app.get("/api/headshot/:sport/:id", async (req, res) => {
+  const { sport, id } = req.params;
+  const sportMap = { mlb:'baseball', nfl:'football', nba:'basketball', nhl:'hockey' };
+  const espnSport = sportMap[sport] || sport;
+  try {
+    const url = `https://a.espncdn.com/combiner/i?img=/i/headshots/${espnSport}/players/full/${id}.png&w=120&h=88`;
+    const response = await espnClient.get(url, { responseType: 'arraybuffer' });
+    res.set('Content-Type', response.headers['content-type'] || 'image/png');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(response.data));
+  } catch(err) {
+    // Return a transparent 1x1 PNG on failure
+    const empty = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==','base64');
+    res.set('Content-Type','image/png');
+    res.send(empty);
+  }
+});
+
 app.get("/api/debug/gamelog/:sport/:id", async (req, res) => {
   const { sport, id } = req.params;
   const { sport: s, league: l } = SPORTS[sport] || {};
