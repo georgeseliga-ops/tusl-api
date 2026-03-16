@@ -816,7 +816,7 @@ app.get("/api/sports/:sport/athletes/:id/gamelog", async (req, res) => {
   }
 });
 
-// Gamelog debug — see raw ESPN response structure
+// Raw ESPN gamelog passthrough — shows exact structure for debugging
 app.get("/api/debug/gamelog/:sport/:id", async (req, res) => {
   const { sport, id } = req.params;
   const { sport: s, league: l } = SPORTS[sport] || {};
@@ -824,15 +824,23 @@ app.get("/api/debug/gamelog/:sport/:id", async (req, res) => {
   try {
     const url = `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/gamelog`;
     const { data } = await espnClient.get(url);
-    const seasonTypes = data.seasonTypes || [];
-    const sample = seasonTypes[0]?.categories?.[0];
+    const st = data.seasonTypes || [];
+    const cat0 = st[0]?.categories?.[0] || {};
+    const evKeys = Object.keys(data.events || {});
     res.json({
-      seasonTypeCount: seasonTypes.length,
-      firstCategoryLabels: sample?.labels || sample?.names || [],
-      firstCategoryEventCount: sample?.events?.length || 0,
-      firstEvent: sample?.events?.[0] || null,
-      eventKeys: Object.keys(data.events || {}),
-      firstEventMeta: Object.values(data.events || {})[0] || null
+      seasonTypeCount: st.length,
+      seasonType0Name: st[0]?.name,
+      cat0Keys: Object.keys(cat0),
+      cat0Name: cat0.name,
+      cat0Labels: cat0.labels,
+      cat0Names: cat0.names,
+      cat0Types: cat0.types,
+      cat0EventCount: cat0.events?.length,
+      cat0Event0: cat0.events?.[0],
+      eventsCount: evKeys.length,
+      firstEventKey: evKeys[0],
+      firstEventValue: data.events?.[evKeys[0]],
+      allCategoryNames: st.flatMap(s => (s.categories||[]).map(c => c.name))
     });
   } catch(e) { res.json({ error: e.message }); }
 });
