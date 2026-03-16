@@ -701,33 +701,38 @@ app.get("/api/sports/:sport/upcoming", async (req, res) => {
   if (cached) return res.json({ games: cached, fromCache: true });
   try {
     const { sport: s, league: l } = SPORTS[sport];
-    const today = new Date();
-    const future = new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000);
     const fmt = d => d.toISOString().slice(0,10).replace(/-/g,'');
-    const url = `${ESPN}/${s}/${l}/scoreboard?dates=${fmt(today)}-${fmt(future)}&limit=100`;
-    const { data } = await espnClient.get(url);
-    const events = data.events || [];
     const teamGames = {};
 
-    events.forEach(ev => {
-      const comps = ev.competitions?.[0];
-      if (!comps) return;
-      const status = comps.status?.type;
-      if (status?.completed) return;
-      const dateStr = ev.date;
-      const competitors = comps.competitors || [];
-      competitors.forEach(team => {
-        const abbrev = team.team?.abbreviation?.toUpperCase();
-        if (!abbrev || teamGames[abbrev]) return;
-        const opp = competitors.find(c => c.team?.abbreviation !== team.team?.abbreviation);
-        teamGames[abbrev] = {
-          opponent: opp?.team?.abbreviation || '?',
-          homeAway: team.homeAway === 'home' ? 'vs' : '@',
-          date: dateStr,
-          inProgress: status?.inProgress || false
-        };
-      });
-    });
+    // Fetch today + next 7 days one at a time until we have all 30 teams covered
+    for (let daysAhead = 0; daysAhead <= 7; daysAhead++) {
+      if (Object.keys(teamGames).length >= 60) break; // all teams covered (2 per game)
+      const day = new Date();
+      day.setDate(day.getDate() + daysAhead);
+      const url = `${ESPN}/${s}/${l}/scoreboard?dates=${fmt(day)}&limit=50`;
+      try {
+        const { data } = await espnClient.get(url);
+        const events = data.events || [];
+        events.forEach(ev => {
+          const comps = ev.competitions?.[0];
+          if (!comps) return;
+          const competitors = comps.competitors || [];
+          competitors.forEach(team => {
+            const abbrev = team.team?.abbreviation?.toUpperCase();
+            if (!abbrev || teamGames[abbrev]) return;
+            const opp = competitors.find(c => c.team?.abbreviation !== team.team?.abbreviation);
+            const status = comps.status?.type;
+            teamGames[abbrev] = {
+              opponent: opp?.team?.abbreviation || '?',
+              homeAway: team.homeAway === 'home' ? 'vs' : '@',
+              date: ev.date,
+              inProgress: status?.inProgress || status?.state === 'in' || false
+            };
+          });
+        });
+      } catch(e) { continue; }
+    }
+
     caches.live.set(cacheKey, teamGames);
     res.json({ games: teamGames, fromCache: false });
   } catch(err) {
