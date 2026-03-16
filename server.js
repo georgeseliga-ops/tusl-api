@@ -754,32 +754,33 @@ app.get("/api/sports/:sport/athletes/:id/gamelog", async (req, res) => {
   const cached = caches.stats.get(cacheKey);
   if (cached) return res.json({ ...cached, fromCache: true });
 
+  // ESPN gamelog stats[] column order by sport (confirmed from API)
+  const STAT_COLUMNS = {
+    nhl: ['G','A','PTS','+/-','PIM','SOG','SH%','PPG','SHG','GWG','OT','FOW%','TOI','ATOI'],
+    nba: ['MIN','FGM','FGA','FG%','3PM','3PA','3P%','FTM','FTA','FT%','OREB','DREB','REB','AST','STL','BLK','TO','PF','PTS'],
+    mlb: ['AB','R','H','2B','3B','HR','RBI','BB','HBP','SO','SB','CS','AVG','OBP','SLG','OPS'],
+    nfl: ['CMP','ATT','YDS','AVG','TD','INT','SACK','RTG','CAR','RYDS','RAVG','RTD','REC','REYDS','REAVG','RETD','FUM']
+  };
+
   try {
     const url = `https://site.web.api.espn.com/apis/common/v3/sports/${s}/${l}/athletes/${id}/gamelog`;
     const { data } = await espnClient.get(url);
-
-    // Log structure to help debug
     const seasonTypes = data.seasonTypes || [];
     const evMeta = data.events || {};
+    const cols = STAT_COLUMNS[sport] || [];
 
-    // Build event map: eventId -> { stats: {label: value}, date, opponent, result }
     const allEvents = {};
 
     seasonTypes.forEach(st => {
       (st.categories || []).forEach(cat => {
-        const labels = cat.labels || cat.names || [];
-        if (!labels.length) return;
         (cat.events || []).forEach(ev => {
           const eid = String(ev.eventId || ev.id || '');
           if (!eid) return;
           if (!allEvents[eid]) allEvents[eid] = { eventId: eid, stats: {} };
-          labels.forEach((lbl, i) => {
-            const val = ev.stats?.[i];
-            if (val !== undefined && val !== null && val !== '') {
-              // Don't overwrite with worse data
-              if (!allEvents[eid].stats[lbl]) {
-                allEvents[eid].stats[lbl] = String(val);
-              }
+          // Map stats array to column names
+          (ev.stats || []).forEach((val, i) => {
+            if (cols[i] && val !== null && val !== undefined) {
+              allEvents[eid].stats[cols[i]] = val;
             }
           });
         });
@@ -788,26 +789,20 @@ app.get("/api/sports/:sport/athletes/:id/gamelog", async (req, res) => {
 
     // Enrich with event metadata
     Object.values(allEvents).forEach(ev => {
-      const meta = evMeta[ev.eventId] || evMeta[String(ev.eventId)] || {};
-      ev.date = meta.gameDate || meta.date || '';
-      ev.opponent = meta.opponent?.abbreviation || meta.opponent?.displayName || meta.atVs || '—';
-      ev.homeAway = meta.homeAway || '';
-      ev.result = meta.gameResult || meta.result || '';
+      const meta = evMeta[ev.eventId] || {};
+      ev.date = meta.gameDate || '';
+      ev.opponent = meta.opponent?.abbreviation || '—';
+      ev.homeAway = meta.atVs === 'at' ? 'away' : 'home';
+      ev.result = meta.gameResult || meta.score || '';
     });
 
-    // Sort by date, take most recent N
     const sorted = Object.values(allEvents)
-      .filter(ev => ev.date) // only games with dates
+      .filter(ev => ev.date)
       .sort((a, b) => new Date(a.date) - new Date(b.date))
       .slice(-limit)
-      .reverse(); // most recent first
+      .reverse();
 
-    console.log(`[Gamelog] ${sport} ${id}: found ${Object.keys(allEvents).length} events, returning ${sorted.length}`);
-    if (sorted.length > 0) {
-      console.log(`[Gamelog] Sample stats keys:`, Object.keys(sorted[0].stats).slice(0, 8));
-    }
-
-    const result = { games: sorted };
+    const result = { games: sorted, columns: cols };
     if (sorted.length > 0) caches.stats.set(cacheKey, result);
     res.json({ ...result, fromCache: false });
   } catch (err) {
