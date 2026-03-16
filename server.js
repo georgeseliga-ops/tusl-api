@@ -377,6 +377,64 @@ app.get("/api/roster/:teamId", authRequired, async (req, res) => {
   }
 });
 
+// ── Roster Lock ──────────────────────────────────────────────────────────────
+// Returns team abbreviations that currently have a game in progress (locked)
+app.get("/api/locked-teams/:sport", async (req, res) => {
+  const { sport } = req.params;
+  if (!SPORTS[sport]) return res.status(400).json({ error: "Invalid sport" });
+  const cacheKey = `locked_${sport}`;
+  const cached = caches.live.get(cacheKey);
+  if (cached !== undefined) return res.json({ locked: cached });
+  try {
+    const { sport: s, league: l } = SPORTS[sport];
+    const { data } = await espnClient.get(`${ESPN}/${s}/${l}/scoreboard`);
+    const locked = new Set();
+    (data.events || []).forEach(ev => {
+      const status = ev.competitions?.[0]?.status?.type;
+      if (status?.inProgress || status?.state === 'in') {
+        (ev.competitions?.[0]?.competitors || []).forEach(c => {
+          if (c.team?.abbreviation) locked.add(c.team.abbreviation.toUpperCase());
+        });
+      }
+    });
+    const lockedArr = [...locked];
+    caches.live.set(cacheKey, lockedArr, 60); // 60 second TTL
+    res.json({ locked: lockedArr, sport, time: new Date().toISOString() });
+  } catch(err) {
+    res.json({ locked: [], error: err.message });
+  }
+});
+
+// Helper: check if player's team is locked
+async function getLockedTeams(sport) {
+  const cacheKey = `locked_${sport}`;
+  const cached = caches.live.get(cacheKey);
+  if (cached !== undefined) return cached;
+  try {
+    const { sport: s, league: l } = SPORTS[sport];
+    const { data } = await espnClient.get(`${ESPN}/${s}/${l}/scoreboard`);
+    const locked = [];
+    (data.events || []).forEach(ev => {
+      const status = ev.competitions?.[0]?.status?.type;
+      if (status?.inProgress || status?.state === 'in') {
+        (ev.competitions?.[0]?.competitors || []).forEach(c => {
+          if (c.team?.abbreviation) locked.push(c.team.abbreviation.toUpperCase());
+        });
+      }
+    });
+    caches.live.set(cacheKey, locked, 60);
+    return locked;
+  } catch(e) { return []; }
+}
+
+// Helper: get a player's real team abbreviation from DB roster or ESPN search
+async function getPlayerTeamAbbrev(sport, playerName) {
+  try {
+    const result = await searchAthlete(sport, playerName);
+    return result.team?.toUpperCase() || null;
+  } catch(e) { return null; }
+}
+
 app.post("/api/roster/ir-move", authRequired, async (req, res) => {
   const { playerName, sport, direction } = req.body;
   if (!playerName || !sport || !direction) return res.status(400).json({ error: "playerName, sport, direction required" });
@@ -400,6 +458,17 @@ app.post("/api/roster/drop", authRequired, async (req, res) => {
   const { playerName, sport } = req.body;
   if (!playerName || !sport) return res.status(400).json({ error: "playerName and sport required" });
   try {
+    // Check if player's game is in progress (locked)
+    const lockedTeams = await getLockedTeams(sport);
+    if (lockedTeams.length > 0) {
+      const playerTeam = await getPlayerTeamAbbrev(sport, playerName);
+      if (playerTeam && lockedTeams.includes(playerTeam)) {
+        return res.status(423).json({
+          error: `🔒 ${playerName} is locked — their game is currently in progress. Drops open again tomorrow.`,
+          locked: true
+        });
+      }
+    }
     await pool.query(
       "DELETE FROM rosters WHERE team_id = $1 AND sport = $2 AND player_name = $3",
       [req.user.teamId, sport, playerName]
@@ -489,6 +558,30 @@ app.post("/api/waivers/claim", authRequired, async (req, res) => {
   if (!playerName || !sport || bidAmount === undefined) {
     return res.status(400).json({ error: "playerName, sport, bidAmount required" });
   }
+
+  // Check roster locks before starting transaction
+  const lockedTeams = await getLockedTeams(sport);
+  if (lockedTeams.length > 0) {
+    // Check player being added
+    const addTeam = await getPlayerTeamAbbrev(sport, playerName);
+    if (addTeam && lockedTeams.includes(addTeam)) {
+      return res.status(423).json({
+        error: `🔒 ${playerName} is locked — their game is in progress. Claims open again tomorrow.`,
+        locked: true
+      });
+    }
+    // Check player being dropped
+    if (dropPlayer) {
+      const dropTeam = await getPlayerTeamAbbrev(sport, dropPlayer);
+      if (dropTeam && lockedTeams.includes(dropTeam)) {
+        return res.status(423).json({
+          error: `🔒 ${dropPlayer} is locked — their game is in progress. Drops open again tomorrow.`,
+          locked: true
+        });
+      }
+    }
+  }
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
