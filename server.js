@@ -246,7 +246,10 @@ async function searchAthlete(sport, name) {
           const fullParts=full.split(/\s+/);
           return full===nameLower||full.includes(nameLower)||(nameParts.length>=2&&fullParts[fullParts.length-1]===nameParts[nameParts.length-1]&&fullParts[0][0]===nameParts[0][0]);
         });
-        if(player?.id&&player.id.toString()!=="1") return{id:player.id.toString(),name:player.fullName||player.displayName||name,found:true,team:team.abbreviation,position:player.position?.abbreviation};
+        if(player?.id&&player.id.toString()!=="1") {
+          const headshot = player.headshot?.href || player.headshot || null;
+          return{id:player.id.toString(),name:player.fullName||player.displayName||name,found:true,team:team.abbreviation,position:player.position?.abbreviation,headshot};
+        }
       } catch(e){}
     }
   } catch(e){}
