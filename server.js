@@ -89,6 +89,16 @@ async function initDB() {
         UNIQUE(team_id, sport, player_name)
       );
 
+      CREATE TABLE IF NOT EXISTS team_state (
+        id SERIAL PRIMARY KEY,
+        team_id INTEGER NOT NULL,
+        sport VARCHAR(10) NOT NULL,
+        dropped_players JSONB DEFAULT '[]',
+        ir_slots JSONB DEFAULT '[null, null]',
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(team_id, sport)
+      );
+
       CREATE TABLE IF NOT EXISTS draft_sessions (
         id SERIAL PRIMARY KEY,
         sport VARCHAR(10) NOT NULL,
@@ -710,6 +720,43 @@ app.post("/api/snapshots/backfill", authRequired, async (req, res) => {
 });
 
 // Get stat snapshots for a team (for post-acquisition stat calculation)
+// Team state (drops + IR) — persisted to DB for cross-device sync
+app.get("/api/team-state/:teamId", authRequired, async (req, res) => {
+  const { teamId } = req.params;
+  if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Forbidden" });
+  try {
+    const result = await pool.query(
+      "SELECT sport, dropped_players, ir_slots FROM team_state WHERE team_id = $1",
+      [teamId]
+    );
+    const state = {};
+    result.rows.forEach(r => {
+      state[r.sport] = {
+        dropped: r.dropped_players || [],
+        irSlots: r.ir_slots || [null, null]
+      };
+    });
+    res.json({ state });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/team-state/:teamId", authRequired, async (req, res) => {
+  const { teamId } = req.params;
+  if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Forbidden" });
+  const { sport, dropped, irSlots } = req.body;
+  if (!sport) return res.status(400).json({ error: "sport required" });
+  try {
+    await pool.query(
+      `INSERT INTO team_state (team_id, sport, dropped_players, ir_slots, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (team_id, sport) DO UPDATE
+       SET dropped_players = $3, ir_slots = $4, updated_at = NOW()`,
+      [teamId, sport, JSON.stringify(dropped || []), JSON.stringify(irSlots || [null, null])]
+    );
+    res.json({ success: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get("/api/snapshots/:teamId", authRequired, async (req, res) => {
   const { teamId } = req.params;
   if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Can only view your own snapshots" });
