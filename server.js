@@ -201,10 +201,17 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: "Login required" });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
+    req.isCommissioner = req.user.teamId === 9;
     next();
   } catch(e) {
     res.status(401).json({ error: "Invalid or expired token" });
   }
+}
+
+// Commissioner middleware — only team 9 can use these routes
+function commissionerRequired(req, res, next) {
+  if (!req.user || req.user.teamId !== 9) return res.status(403).json({ error: "Commissioner access required" });
+  next();
 }
 
 // ── ESPN Helpers ──────────────────────────────────────────────────────────
@@ -465,29 +472,31 @@ app.post("/api/roster/ir-move", authRequired, async (req, res) => {
 });
 
 app.post("/api/roster/drop", authRequired, async (req, res) => {
-  const { playerName, sport } = req.body;
+  const { playerName, sport, onBehalfOf } = req.body;
   if (!playerName || !sport) return res.status(400).json({ error: "playerName and sport required" });
+  const targetTeamId = (req.isCommissioner && onBehalfOf) ? parseInt(onBehalfOf) : req.user.teamId;
   try {
-    // Check if player's game is in progress (locked)
-    const lockedTeams = await getLockedTeams(sport);
-    if (lockedTeams.length > 0) {
-      const playerTeam = await getPlayerTeamAbbrev(sport, playerName);
-      if (playerTeam && lockedTeams.includes(playerTeam)) {
-        return res.status(423).json({
-          error: `🔒 ${playerName} is locked — their game is currently in progress. Drops open again tomorrow.`,
-          locked: true
-        });
+    // Check if player's game is in progress (locked) — commissioners can bypass
+    if (!req.isCommissioner) {
+      const lockedTeams = await getLockedTeams(sport);
+      if (lockedTeams.length > 0) {
+        const playerTeam = await getPlayerTeamAbbrev(sport, playerName);
+        if (playerTeam && lockedTeams.includes(playerTeam)) {
+          return res.status(423).json({
+            error: `🔒 ${playerName} is locked — their game is currently in progress. Drops open again tomorrow.`,
+            locked: true
+          });
+        }
       }
     }
     await pool.query(
       "DELETE FROM rosters WHERE team_id = $1 AND sport = $2 AND player_name = $3",
-      [req.user.teamId, sport, playerName]
+      [targetTeamId, sport, playerName]
     );
     await pool.query(
-      "INSERT INTO transactions (team_id, type, sport, player_out) VALUES ($1, $2, $3, $4)",
-      [req.user.teamId, "drop", sport, playerName]
+      "INSERT INTO transactions (team_id, type, sport, player_out, notes) VALUES ($1, $2, $3, $4, $5)",
+      [targetTeamId, "drop", sport, playerName, req.isCommissioner && onBehalfOf ? 'Commissioner action' : null]
     );
-    // Bust FA cache so dropped player reappears
     caches.freeagents.del(`fa_${sport}_all`);
     res.json({ success: true, dropped: playerName });
   } catch(err) {
@@ -563,6 +572,64 @@ app.post("/api/waivers/bid", authRequired, async (req, res) => {
 });
 
 // Instant claim — add player immediately, optionally drop one, deduct FAAB
+// ── Commissioner Routes ──────────────────────────────────────────────────────
+
+// Add player to any team (commissioner only — used for draft results entry)
+app.post("/api/commissioner/roster/add", authRequired, commissionerRequired, async (req, res) => {
+  const { teamId, playerName, sport, position, price } = req.body;
+  if (!teamId || !playerName || !sport || !position) {
+    return res.status(400).json({ error: "teamId, playerName, sport, position required" });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO rosters (team_id, sport, player_name, position, slot, auction_price)
+       VALUES ($1, $2, $3, $4, 'active', $5)
+       ON CONFLICT (team_id, sport, player_name) DO UPDATE SET position=$4, auction_price=$5`,
+      [teamId, sport, playerName, position, price || 0]
+    );
+    await pool.query(
+      `INSERT INTO transactions (team_id, type, sport, player_in, faab_spent, notes)
+       VALUES ($1, 'draft', $2, $3, $4, 'Commissioner draft entry')`,
+      [teamId, sport, playerName, price || 0]
+    );
+    // Update user FAAB balance
+    if (price > 0) {
+      await pool.query(
+        `UPDATE users SET faab_balance = faab_balance - $1 WHERE team_id = $2`,
+        [price, teamId]
+      );
+    }
+    caches.freeagents.del(`fa_${sport}_all`);
+    res.json({ success: true, added: playerName, teamId, price });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Remove player from any team (commissioner only)
+app.post("/api/commissioner/roster/remove", authRequired, commissionerRequired, async (req, res) => {
+  const { teamId, playerName, sport } = req.body;
+  if (!teamId || !playerName || !sport) return res.status(400).json({ error: "teamId, playerName, sport required" });
+  try {
+    await pool.query(
+      "DELETE FROM rosters WHERE team_id=$1 AND sport=$2 AND player_name=$3",
+      [teamId, sport, playerName]
+    );
+    caches.freeagents.del(`fa_${sport}_all`);
+    res.json({ success: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Set FAAB balance for any team (commissioner only)
+app.post("/api/commissioner/faab", authRequired, commissionerRequired, async (req, res) => {
+  const { teamId, balance } = req.body;
+  if (!teamId || balance === undefined) return res.status(400).json({ error: "teamId and balance required" });
+  try {
+    await pool.query("UPDATE users SET faab_balance=$1 WHERE team_id=$2", [balance, teamId]);
+    res.json({ success: true, teamId, balance });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/api/waivers/claim", authRequired, async (req, res) => {
   const { playerName, sport, position, bidAmount, dropPlayer, espnId } = req.body;
   if (!playerName || !sport || bidAmount === undefined) {
