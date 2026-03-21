@@ -818,6 +818,22 @@ app.get("/api/transactions/:teamId", authRequired, async (req, res) => {
   }
 });
 
+// League-wide transactions — public, all teams
+app.get("/api/transactions", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT t.*, u.team_name, u.owner_name
+      FROM transactions t
+      LEFT JOIN users u ON t.team_id = u.team_id
+      ORDER BY t.created_at DESC
+      LIMIT 200
+    `);
+    res.json({ transactions: result.rows });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Existing ESPN routes ───────────────────────────────────────────────────
 app.get("/",(req,res)=>res.json({name:"T.U.S.L. API v5 — with Auth & DB",sports:["mlb","nfl","nba","nhl"]}));
 app.get("/health",(req,res)=>res.json({status:"ok",uptime:`${Math.floor(process.uptime())}s`,db:"connected"}));
