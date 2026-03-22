@@ -1471,12 +1471,26 @@ app.get("/api/draft/playercard/:sport/:espnId", async (req, res) => {
       return Math.round(v);
     };
 
+    const STAT_ABBREVS = {
+      gamesPlayed:'G', homeRuns:'HR', RBIs:'RBI', runs:'R', stolenBases:'SB', hits:'H',
+      doubles:'2B', walks:'BB', battingAverage:'AVG', onBasePct:'OBP', sluggingPct:'SLG',
+      wins:'W', losses:'L', ERA:'ERA', strikeouts:'K', inningsPitched:'IP', WHIP:'WHIP',
+      saves:'SV', holds:'HLD', gamesStarted:'GS',
+      passingYards:'PYDS', passingTouchdowns:'PTD', interceptions:'INT',
+      rushingYards:'RYDS', rushingTouchdowns:'RTD', receivingYards:'RECYDS',
+      receivingTouchdowns:'RecTD', receptions:'REC',
+      points:'PTS', rebounds:'REB', assists:'AST', steals:'STL', blockedShots:'BLK',
+      fieldGoalPct:'FG%', threePointPct:'3P%', turnovers:'TO',
+      goals:'G', assists_nhl:'A', plusMinus:'+/-', powerPlayGoals:'PPG', powerPlayPoints:'PPP',
+      shots:'SOG', goaltenderWins:'W', saves_nhl:'SV', savePercentage:'SV%', goalsAgainstAverage:'GAA'
+    };
+
     const makeStats = (statsObj) => displayKeys.map(key => {
       const v = statsObj[key];
       const formatted = fmt(v, key);
       return formatted !== null ? {
         key,
-        label: key.replace(/([A-Z])/g,' $1').trim().replace(/^./, c=>c.toUpperCase())
+        label: STAT_ABBREVS[key] || key.replace(/([A-Z])/g,' $1').trim().replace(/^./, c=>c.toUpperCase())
           .replace('Rbis','RBI').replace('Era','ERA').replace('Whip','WHIP')
           .replace('Pct',' %').replace('Avg','AVG').replace('Obp','OBP').replace('Slg','SLG'),
         value: formatted
