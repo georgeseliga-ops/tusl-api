@@ -382,16 +382,42 @@ app.get("/api/auth/me", authRequired, async (req, res) => {
 
 app.get("/api/roster/:teamId", authRequired, async (req, res) => {
   const { teamId } = req.params;
-  if (parseInt(teamId) !== req.user.teamId) return res.status(403).json({ error: "Can only view your own roster" });
+  const requestedId = parseInt(teamId);
+  // Allow commissioner (team 9) to view any roster
+  if (requestedId !== req.user.teamId && req.user.teamId !== 9) {
+    return res.status(403).json({ error: "Can only view your own roster" });
+  }
   try {
     const result = await pool.query(
       "SELECT * FROM rosters WHERE team_id = $1 ORDER BY sport, slot, added_at",
-      [teamId]
+      [requestedId]
     );
-    res.json({ teamId: parseInt(teamId), roster: result.rows });
+    res.json({ teamId: requestedId, roster: result.rows });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Public draft roster endpoint — returns all teams' draft picks for a sport from active session
+app.get("/api/draft/:sport/rosters", async (req, res) => {
+  const { sport } = req.params;
+  try {
+    const session = await pool.query(
+      "SELECT id FROM draft_sessions WHERE sport=$1 AND status IN ('active','waiting') ORDER BY created_at DESC LIMIT 1", [sport]
+    );
+    if (!session.rows.length) return res.json({ picks: [], byTeam: {} });
+    const sid = session.rows[0].id;
+    const picks = await pool.query(
+      "SELECT dr.*, u.team_id FROM draft_results dr LEFT JOIN users u ON u.team_id = dr.team_id WHERE dr.session_id=$1 ORDER BY dr.id DESC",
+      [sid]
+    );
+    const byTeam = {};
+    picks.rows.forEach(p => {
+      if (!byTeam[p.team_id]) byTeam[p.team_id] = [];
+      byTeam[p.team_id].push(p);
+    });
+    res.json({ picks: picks.rows, byTeam });
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Roster Lock ──────────────────────────────────────────────────────────────
@@ -1569,6 +1595,16 @@ app.post("/api/draft/:sport/reset", authRequired, async (req, res) => {
     );
     for (const row of sessions.rows) {
       const sid = row.id;
+      // Remove roster entries that were added via this draft session
+      const draftedPlayers = await pool.query(
+        "SELECT team_id, player_name FROM draft_results WHERE session_id = $1", [sid]
+      );
+      for (const p of draftedPlayers.rows) {
+        await pool.query(
+          "DELETE FROM rosters WHERE team_id=$1 AND sport=$2 AND player_name=$3",
+          [p.team_id, sport, p.player_name]
+        );
+      }
       await pool.query("DELETE FROM draft_bids WHERE session_id = $1", [sid]);
       await pool.query("DELETE FROM draft_nominations WHERE session_id = $1", [sid]);
       await pool.query("DELETE FROM draft_results WHERE session_id = $1", [sid]);
