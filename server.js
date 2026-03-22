@@ -1214,7 +1214,7 @@ app.get("/api/debug/:sport/:id", async (req, res) => {
 // ── Draft Routes ──────────────────────────────────────────────────────────
 
 const DRAFT_ROSTER_SLOTS = {
-  mlb: ['Infielder 1','Infielder 2','Outfielder 1','Outfielder 2','UTIL','Pitcher 1','Pitcher 2','Relief Pitcher'],
+  mlb: ['Infielder 1','Infielder 2','Outfielder 1','Outfielder 2','UTIL','Pitcher 1','Pitcher 2','Pitcher 3'],
   nfl: ['QB','RB 1','RB 2','WR 1','WR 2','TE']
 };
 
@@ -1508,6 +1508,28 @@ app.post("/api/draft/:sport/close-nomination", authRequired, async (req, res) =>
 
 // Reset draft session
 // Force-fix nomination order (commissioner only)
+// Clear all roster entries that came from a draft session for a sport (commissioner only)
+app.post("/api/draft/:sport/clear-rosters", authRequired, commissionerRequired, async (req, res) => {
+  const { sport } = req.params;
+  try {
+    // Get all players ever drafted in any session for this sport and remove from rosters
+    const drafted = await pool.query(
+      "SELECT DISTINCT team_id, player_name FROM draft_results WHERE sport=$1", [sport]
+    );
+    let cleared = 0;
+    for (const row of drafted.rows) {
+      const r = await pool.query(
+        "DELETE FROM rosters WHERE team_id=$1 AND sport=$2 AND player_name=$3 RETURNING id",
+        [row.team_id, sport, row.player_name]
+      );
+      cleared += r.rowCount;
+    }
+    // Also clear any draft_results entries so they don't linger
+    await pool.query("DELETE FROM draft_results WHERE sport=$1", [sport]);
+    res.json({ success: true, cleared });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 // Erase last pick (commissioner only)
 app.post("/api/draft/:sport/erase-last-pick", authRequired, commissionerRequired, async (req, res) => {
   const { sport } = req.params;
