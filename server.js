@@ -1433,6 +1433,7 @@ app.get("/api/draft/:sport/playerstats", async (req, res) => {
 // Player card with 2024 + 2025 stats (enhanced)
 app.get("/api/draft/playercard/:sport/:espnId", async (req, res) => {
   const { sport, espnId } = req.params;
+  const posParam = (req.query.pos || '').toUpperCase().trim();
   try {
     // Try 2025 first, fall back to 2024
     const [stats2025, stats2024] = await Promise.allSettled([
@@ -1455,11 +1456,20 @@ app.get("/api/draft/playercard/:sport/:espnId", async (req, res) => {
     const current = stats2025.status === 'fulfilled' ? stats2025.value : { stats: {}, name: null };
     const prior = stats2024.status === 'fulfilled' ? stats2024.value : { stats: {} };
 
-    const PITCHER_POS = new Set(['SP','RP','P']);
-    // Detect position from stats
-    const isPitcher = PITCHER_POSITIONS.has((nomination?.position || '').toUpperCase()) ||
-                      (current.stats?.ERA !== undefined || current.stats?.W !== undefined ||
-                       prior?.stats?.ERA !== undefined);
+    // isPitcher: use explicit pos param first, then smart heuristics
+    let isPitcher = false;
+    if (posParam) {
+      isPitcher = PITCHER_POSITIONS.has(posParam);
+    } else {
+      const cs = current.stats || {};
+      const ps = prior.stats || {};
+      // Pitchers have ERA and IP but no batting average or HR
+      const hasERA = (cs.ERA !== undefined && cs.ERA > 0) || (ps.ERA !== undefined && ps.ERA > 0);
+      const hasIP  = (cs.inningsPitched > 5) || (ps.inningsPitched > 5);
+      const hasHR  = (cs.homeRuns > 0) || (ps.homeRuns > 0);
+      const hasAVG = cs.battingAverage !== undefined || ps.battingAverage !== undefined;
+      isPitcher = (hasERA || hasIP) && !hasHR && !hasAVG;
+    }
 
     const fpts2025 = calcFPTS(sport, current.stats, isPitcher ? 'SP' : 'OF');
     const fpts2024 = calcFPTS(sport, prior.stats || {}, isPitcher ? 'SP' : 'OF');
