@@ -1347,14 +1347,27 @@ app.post("/api/draft/:sport/pause", authRequired, async (req, res) => {
 // Player card for draft room — returns stats + fantasy projection
 // Fantasy scoring weights (shared)
 const FPTS_WEIGHTS = {
-  mlb: { HR:4, RBI:1, SB:2, H:0.5, BB:1, W:5, SO:1, SV:5, HLD:3 },
+  mlb_hitter:  { HR:4, RBI:1, SB:2, H:0.5, BB:1, R:0.5 },           // NO strikeouts for hitters
+  mlb_pitcher: { W:5, SO:1, SV:5, HLD:3, IP:0.5 },                    // SO only for pitchers
   nfl: { passingYards:0.04, passingTouchdowns:4, rushingYards:0.1, rushingTouchdowns:6, receivingYards:0.1, receivingTouchdowns:6, receptions:0.5 },
   nba: { points:1, rebounds:1.2, assists:1.5, steals:3, blockedShots:3, fieldGoalsMade:0, turnovers:-1 },
   nhl: { goals:3, assists:2, shots:0.2, powerPlayPoints:1, goaltenderWins:5, saves:0.1, shortHandedPoints:2 }
 };
 
-function calcFPTS(sport, stats) {
-  const weights = FPTS_WEIGHTS[sport] || {};
+const PITCHER_POSITIONS = new Set(['SP','RP','P']);
+
+function calcFPTS(sport, stats, position) {
+  let weights;
+  if (sport === 'mlb') {
+    const pos = (position || '').toUpperCase();
+    weights = PITCHER_POSITIONS.has(pos) ? FPTS_WEIGHTS.mlb_pitcher : FPTS_WEIGHTS.mlb_hitter;
+    // Also detect by stats if position unknown — pitchers have ERA/IP
+    if (!position && (stats.ERA !== undefined || stats.W !== undefined)) {
+      weights = FPTS_WEIGHTS.mlb_pitcher;
+    }
+  } else {
+    weights = FPTS_WEIGHTS[sport] || {};
+  }
   let total = 0;
   for (const [key, w] of Object.entries(weights)) {
     total += (parseFloat(stats[key]) || 0) * w;
@@ -1444,13 +1457,12 @@ app.get("/api/draft/playercard/:sport/:espnId", async (req, res) => {
 
     const PITCHER_POS = new Set(['SP','RP','P']);
     // Detect position from stats
-    const isPitcher = (current.stats?.ERA !== undefined || current.stats?.W !== undefined ||
-                       prior.value?.stats?.ERA !== undefined) ||
-                      (current.stats?.gamesStarted > 0);
+    const isPitcher = PITCHER_POSITIONS.has((nomination?.position || '').toUpperCase()) ||
+                      (current.stats?.ERA !== undefined || current.stats?.W !== undefined ||
+                       prior?.stats?.ERA !== undefined);
 
-    const scoring = FPTS_WEIGHTS[sport] || {};
-    const fpts2025 = calcFPTS(sport, current.stats);
-    const fpts2024 = calcFPTS(sport, prior.stats || {});
+    const fpts2025 = calcFPTS(sport, current.stats, isPitcher ? 'SP' : 'OF');
+    const fpts2024 = calcFPTS(sport, prior.stats || {}, isPitcher ? 'SP' : 'OF');
 
     // Build stat rows for display
     const MLB_HITTER_KEYS  = ['gamesPlayed','homeRuns','RBIs','runs','stolenBases','hits','doubles','walks','battingAverage','onBasePct','sluggingPct'];
