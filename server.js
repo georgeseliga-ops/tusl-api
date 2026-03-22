@@ -1345,43 +1345,153 @@ app.post("/api/draft/:sport/pause", authRequired, async (req, res) => {
 
 // Nominate a player
 // Player card for draft room — returns stats + fantasy projection
+// Fantasy scoring weights (shared)
+const FPTS_WEIGHTS = {
+  mlb: { HR:4, RBI:1, SB:2, H:0.5, BB:1, W:5, SO:1, SV:5, HLD:3 },
+  nfl: { passingYards:0.04, passingTouchdowns:4, rushingYards:0.1, rushingTouchdowns:6, receivingYards:0.1, receivingTouchdowns:6, receptions:0.5 },
+  nba: { points:1, rebounds:1.2, assists:1.5, steals:3, blockedShots:3, fieldGoalsMade:0, turnovers:-1 },
+  nhl: { goals:3, assists:2, shots:0.2, powerPlayPoints:1, goaltenderWins:5, saves:0.1, shortHandedPoints:2 }
+};
+
+function calcFPTS(sport, stats) {
+  const weights = FPTS_WEIGHTS[sport] || {};
+  let total = 0;
+  for (const [key, w] of Object.entries(weights)) {
+    total += (parseFloat(stats[key]) || 0) * w;
+  }
+  return Math.round(total * 10) / 10;
+}
+
+// MLB stat display config
+const STAT_DISPLAY = {
+  mlb: {
+    hitter: [
+      { key:'GP', label:'G' }, { key:'HR', label:'HR' }, { key:'RBI', label:'RBI' },
+      { key:'H', label:'H' }, { key:'R', label:'R' }, { key:'SB', label:'SB' },
+      { key:'BB', label:'BB' }, { key:'AVG', label:'AVG' }, { key:'OPS', label:'OPS' }
+    ],
+    pitcher: [
+      { key:'GP', label:'G' }, { key:'W', label:'W' }, { key:'ERA', label:'ERA' },
+      { key:'SO', label:'K' }, { key:'IP', label:'IP' }, { key:'WHIP', label:'WHIP' },
+      { key:'SV', label:'SV' }, { key:'HLD', label:'HLD' }
+    ]
+  },
+  nhl: [
+    { key:'GP', label:'G' }, { key:'G', label:'G' }, { key:'A', label:'A' },
+    { key:'+/-', label:'+/-' }, { key:'SOG', label:'SOG' }, { key:'PPP', label:'PPP' }
+  ],
+  nba: [
+    { key:'GP', label:'G' }, { key:'PTS', label:'PTS' }, { key:'REB', label:'REB' },
+    { key:'AST', label:'AST' }, { key:'STL', label:'STL' }, { key:'BLK', label:'BLK' }, { key:'FG%', label:'FG%' }
+  ],
+  nfl: [
+    { key:'passingYards', label:'PYDS' }, { key:'passingTouchdowns', label:'PTD' },
+    { key:'rushingYards', label:'RYDS' }, { key:'rushingTouchdowns', label:'RTD' },
+    { key:'receivingYards', label:'RECYDS' }, { key:'receptions', label:'REC' }
+  ]
+};
+
+// Bulk stat fetch for all players (used by draft room) — fetches 2024 stats, cached aggressively
+app.get("/api/draft/:sport/playerstats", async (req, res) => {
+  const { sport } = req.params;
+  if (!SPORTS[sport]) return res.status(400).json({ error: 'Invalid sport' });
+  const cacheKey = `draft_playerstats_${sport}`;
+  const cached = caches.freeagents.get(cacheKey);
+  if (cached) return res.json({ stats: cached, fromCache: true });
+
+  const {sport:s, league:l} = SPORTS[sport];
+  try {
+    // Fetch 2024 season leaders/stats from ESPN summary endpoint
+    const year = '2024';
+    const resp = await espnClient.get(
+      `${ESPN}/${s}/${l}/athletes?limit=1000&active=true`
+    );
+    const athletes = resp.data?.items || resp.data?.athletes || [];
+
+    // Return placeholder — actual per-player stats fetched on hover via playercard
+    const result = {};
+    caches.freeagents.set(cacheKey, result, 3600); // 1hr cache
+    res.json({ stats: result, fromCache: false });
+  } catch(err) {
+    res.json({ stats: {}, error: err.message });
+  }
+});
+
+// Player card with 2024 + 2025 stats (enhanced)
 app.get("/api/draft/playercard/:sport/:espnId", async (req, res) => {
   const { sport, espnId } = req.params;
   try {
-    const statsData = await getAthleteStats(sport, espnId);
-    const stats = statsData.stats || {};
+    // Try 2025 first, fall back to 2024
+    const [stats2025, stats2024] = await Promise.allSettled([
+      getAthleteStats(sport, espnId),
+      (async () => {
+        const {sport:s,league:l}=SPORTS[sport];
+        const resp = await espnClient.get(`${COREAPI}/${s}/leagues/${l}/seasons/2024/types/2/athletes/${espnId}/statistics`);
+        if (!resp.data?.splits) throw new Error('no data');
+        const flat = {};
+        (resp.data.splits?.categories||[]).forEach(cat => {
+          (cat.stats||[]).forEach(stat => {
+            if (stat.name) flat[stat.name] = parseFloat(stat.value)||0;
+            if (stat.abbreviation) flat[stat.abbreviation] = parseFloat(stat.value)||0;
+          });
+        });
+        return { stats: flat, name: resp.data.athlete?.displayName };
+      })()
+    ]);
 
-    // Fantasy scoring weights
-    const scoring = {
-      mlb: { hr:3, rbi:1, sb:2, h:0.25, w:4, so:1 },
-      nfl: { passingYards:0.04, passingTouchdowns:4, rushingYards:0.1, rushingTouchdowns:6, receivingYards:0.1, receivingTouchdowns:6 },
-      nba: { points:0.1, rebounds:0.15, assists:0.2, steals:0.4, blockedShots:0.4, fieldGoalsMade:0.1 },
-      nhl: { goals:2, assists:1.5, shots:0.1, powerPlayPoints:0.5, goaltenderWins:3, saves:0.05 }
-    }[sport] || {};
+    const current = stats2025.status === 'fulfilled' ? stats2025.value : { stats: {}, name: null };
+    const prior = stats2024.status === 'fulfilled' ? stats2024.value : { stats: {} };
 
-    // Compute fantasy points from season stats
-    let fpts = 0;
-    for (const [key, weight] of Object.entries(scoring)) {
-      fpts += (parseFloat(stats[key]) || 0) * weight;
-    }
+    const PITCHER_POS = new Set(['SP','RP','P']);
+    // Detect position from stats
+    const isPitcher = (current.stats?.ERA !== undefined || current.stats?.W !== undefined ||
+                       prior.value?.stats?.ERA !== undefined) ||
+                      (current.stats?.gamesStarted > 0);
 
-    // Key display stats by sport
-    const displayStats = {
-      mlb: ['gamesPlayed','homeRuns','RBIs','stolenBases','hits','battingAverage','ERA','strikeouts','wins'],
-      nfl: ['passingYards','passingTouchdowns','rushingYards','rushingTouchdowns','receivingYards','receivingTouchdowns'],
-      nba: ['gamesPlayed','points','rebounds','assists','steals','blockedShots','fieldGoalPct'],
-      nhl: ['gamesPlayed','goals','assists','plusMinus','shots','powerPlayPoints','goaltenderWins','saves','savePercentage']
+    const scoring = FPTS_WEIGHTS[sport] || {};
+    const fpts2025 = calcFPTS(sport, current.stats);
+    const fpts2024 = calcFPTS(sport, prior.stats || {});
+
+    // Build stat rows for display
+    const MLB_HITTER_KEYS  = ['gamesPlayed','homeRuns','RBIs','runs','stolenBases','hits','doubles','walks','battingAverage','onBasePct','sluggingPct'];
+    const MLB_PITCHER_KEYS = ['gamesPlayed','wins','losses','ERA','strikeouts','walks','inningsPitched','WHIP','saves','holds','gamesStarted'];
+    const displayKeys = {
+      mlb: isPitcher ? MLB_PITCHER_KEYS : MLB_HITTER_KEYS,
+      nfl: ['gamesPlayed','passingYards','passingTouchdowns','interceptions','rushingYards','rushingTouchdowns','receivingYards','receivingTouchdowns','receptions'],
+      nba: ['gamesPlayed','points','rebounds','assists','steals','blockedShots','fieldGoalPct','threePointPct'],
+      nhl: ['gamesPlayed','goals','assists','points','plusMinus','powerPlayGoals','powerPlayPoints','shots','goaltenderWins','saves','savePercentage','goalsAgainstAverage']
     }[sport] || [];
 
-    const statDisplay = displayStats.map(key => ({
-      key,
-      label: key.replace(/([A-Z])/g,' $1').replace(/^./, s=>s.toUpperCase()).trim(),
-      value: stats[key] ?? null
-    })).filter(s => s.value !== null && s.value !== 0);
+    const fmt = (v, key) => {
+      if (v === null || v === undefined || v === 0) return null;
+      if (['battingAverage','onBasePct','sluggingPct','fieldGoalPct','threePointPct','savePercentage','WHIP'].includes(key))
+        return v < 1 ? v.toFixed(3).replace(/^0/,'') : v.toFixed(3);
+      if (['ERA','goalsAgainstAverage'].includes(key)) return v.toFixed(2);
+      if (['inningsPitched'].includes(key)) return v.toFixed(1);
+      return Math.round(v);
+    };
 
-    res.json({ espnId, name: statsData.name, stats: statDisplay, fantasyPoints: Math.round(fpts * 10) / 10, rawStats: stats });
+    const makeStats = (statsObj) => displayKeys.map(key => {
+      const v = statsObj[key];
+      const formatted = fmt(v, key);
+      return formatted !== null ? {
+        key,
+        label: key.replace(/([A-Z])/g,' $1').trim().replace(/^./, c=>c.toUpperCase())
+          .replace('Rbis','RBI').replace('Era','ERA').replace('Whip','WHIP')
+          .replace('Pct',' %').replace('Avg','AVG').replace('Obp','OBP').replace('Slg','SLG'),
+        value: formatted
+      } : null;
+    }).filter(Boolean);
+
+    res.json({
+      espnId, name: current.name || prior.name,
+      stats2025: makeStats(current.stats),
+      stats2024: makeStats(prior.stats || {}),
+      fpts2025, fpts2024,
+      isPitcher
+    });
   } catch(err) {
-    res.json({ espnId, stats: [], fantasyPoints: 0, error: err.message });
+    res.json({ espnId, stats2025: [], stats2024: [], fpts2025: 0, fpts2024: 0, error: err.message });
   }
 });
 
