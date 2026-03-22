@@ -1202,7 +1202,7 @@ app.get("/api/draft/:sport/session", async (req, res) => {
     );
     if (result.rows.length === 0) {
       // Create new session
-      const order = [1,2,3,4,5,6,7,8,9,10]; // team IDs 1-10
+      const order = [9,1,2,3,4,5,6,7,8,10]; // George's Giants nominates first
       result = await pool.query(
         "INSERT INTO draft_sessions (sport, status, nomination_order, commissioner_team_id) VALUES ($1, 'waiting', $2, 9) RETURNING *",
         [sport, JSON.stringify(order)]
@@ -1318,6 +1318,47 @@ app.post("/api/draft/:sport/pause", authRequired, async (req, res) => {
 });
 
 // Nominate a player
+// Player card for draft room — returns stats + fantasy projection
+app.get("/api/draft/playercard/:sport/:espnId", async (req, res) => {
+  const { sport, espnId } = req.params;
+  try {
+    const statsData = await getAthleteStats(sport, espnId);
+    const stats = statsData.stats || {};
+
+    // Fantasy scoring weights
+    const scoring = {
+      mlb: { hr:3, rbi:1, sb:2, h:0.25, w:4, so:1 },
+      nfl: { passingYards:0.04, passingTouchdowns:4, rushingYards:0.1, rushingTouchdowns:6, receivingYards:0.1, receivingTouchdowns:6 },
+      nba: { points:0.1, rebounds:0.15, assists:0.2, steals:0.4, blockedShots:0.4, fieldGoalsMade:0.1 },
+      nhl: { goals:2, assists:1.5, shots:0.1, powerPlayPoints:0.5, goaltenderWins:3, saves:0.05 }
+    }[sport] || {};
+
+    // Compute fantasy points from season stats
+    let fpts = 0;
+    for (const [key, weight] of Object.entries(scoring)) {
+      fpts += (parseFloat(stats[key]) || 0) * weight;
+    }
+
+    // Key display stats by sport
+    const displayStats = {
+      mlb: ['gamesPlayed','homeRuns','RBIs','stolenBases','hits','battingAverage','ERA','strikeouts','wins'],
+      nfl: ['passingYards','passingTouchdowns','rushingYards','rushingTouchdowns','receivingYards','receivingTouchdowns'],
+      nba: ['gamesPlayed','points','rebounds','assists','steals','blockedShots','fieldGoalPct'],
+      nhl: ['gamesPlayed','goals','assists','plusMinus','shots','powerPlayPoints','goaltenderWins','saves','savePercentage']
+    }[sport] || [];
+
+    const statDisplay = displayStats.map(key => ({
+      key,
+      label: key.replace(/([A-Z])/g,' $1').replace(/^./, s=>s.toUpperCase()).trim(),
+      value: stats[key] ?? null
+    })).filter(s => s.value !== null && s.value !== 0);
+
+    res.json({ espnId, name: statsData.name, stats: statDisplay, fantasyPoints: Math.round(fpts * 10) / 10, rawStats: stats });
+  } catch(err) {
+    res.json({ espnId, stats: [], fantasyPoints: 0, error: err.message });
+  }
+});
+
 app.post("/api/draft/:sport/nominate", authRequired, async (req, res) => {
   const { sport } = req.params;
   const { playerName, espnId, position, minBid } = req.body;
