@@ -1482,6 +1482,72 @@ app.post("/api/draft/:sport/close-nomination", authRequired, async (req, res) =>
 
 // Reset draft session
 // Force-fix nomination order (commissioner only)
+// Erase last pick (commissioner only)
+app.post("/api/draft/:sport/erase-last-pick", authRequired, commissionerRequired, async (req, res) => {
+  const { sport } = req.params;
+  try {
+    const session = await pool.query(
+      "SELECT * FROM draft_sessions WHERE sport=$1 AND status IN ('active','waiting') ORDER BY created_at DESC LIMIT 1", [sport]
+    );
+    if (!session.rows.length) return res.status(400).json({ error: 'No active session' });
+    const s = session.rows[0];
+
+    // Get last result
+    const last = await pool.query(
+      "SELECT * FROM draft_results WHERE session_id=$1 ORDER BY id DESC LIMIT 1", [s.id]
+    );
+    if (!last.rows.length) return res.status(400).json({ error: 'No picks to erase' });
+    const pick = last.rows[0];
+
+    // Refund budget to user
+    await pool.query("UPDATE users SET faab_balance = faab_balance + $1 WHERE team_id=$2", [pick.winning_bid, pick.team_id]);
+
+    // Remove from DB roster if it was added there
+    await pool.query("DELETE FROM rosters WHERE team_id=$1 AND sport=$2 AND player_name=$3", [pick.team_id, sport, pick.player_name]);
+
+    // Remove the draft result
+    await pool.query("DELETE FROM draft_results WHERE id=$1", [pick.id]);
+
+    // Step back nominator index
+    const order = typeof s.nomination_order === 'string' ? JSON.parse(s.nomination_order) : s.nomination_order;
+    const prevIdx = ((s.current_nominator_idx - 1) + order.length) % order.length;
+    await pool.query("UPDATE draft_sessions SET current_nominator_idx=$1 WHERE id=$2", [prevIdx, s.id]);
+
+    res.json({ success: true, erased: pick.player_name, refund: pick.winning_bid });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Commissioner nominates on behalf of any team
+app.post("/api/draft/:sport/nominate-for", authRequired, commissionerRequired, async (req, res) => {
+  const { sport } = req.params;
+  const { playerName, espnId, position, minBid, onBehalfOfTeamId } = req.body;
+  if (!playerName || !onBehalfOfTeamId) return res.status(400).json({ error: 'playerName and onBehalfOfTeamId required' });
+  try {
+    const session = await pool.query(
+      "SELECT * FROM draft_sessions WHERE sport=$1 AND status='active' ORDER BY created_at DESC LIMIT 1", [sport]
+    );
+    if (!session.rows.length) return res.status(400).json({ error: 'No active draft session' });
+    const s = session.rows[0];
+
+    const existing = await pool.query("SELECT id FROM draft_nominations WHERE session_id=$1 AND status='active'", [s.id]);
+    if (existing.rows.length) return res.status(400).json({ error: 'A player is already up for bid' });
+
+    const alreadyDrafted = await pool.query("SELECT id FROM draft_results WHERE session_id=$1 AND player_name ILIKE $2", [s.id, playerName]);
+    if (alreadyDrafted.rows.length) return res.status(400).json({ error: `${playerName} already drafted` });
+
+    const bidEndsAt = new Date(Date.now() + 30000);
+    const nom = await pool.query(
+      "INSERT INTO draft_nominations (session_id, nominating_team_id, player_name, player_espn_id, position, min_bid, bid_ends_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+      [s.id, onBehalfOfTeamId, playerName, espnId || null, position || 'UTIL', minBid || 1, bidEndsAt]
+    );
+    await pool.query(
+      "INSERT INTO draft_bids (nomination_id, session_id, team_id, bid_amount) VALUES ($1,$2,$3,$4)",
+      [nom.rows[0].id, s.id, onBehalfOfTeamId, minBid || 1]
+    );
+    res.json({ success: true, nomination: nom.rows[0] });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/api/draft/:sport/fix-order", authRequired, commissionerRequired, async (req, res) => {
   const { sport } = req.params;
   const order = [9,1,2,3,4,5,6,7,8,10];
