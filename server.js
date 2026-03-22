@@ -506,6 +506,28 @@ app.post("/api/roster/drop", authRequired, async (req, res) => {
 
 // ── Waiver / Free Agent Routes ─────────────────────────────────────────────
 
+// All players for a sport — used by draft room player panel
+app.get("/api/sports/:sport/allplayers", async (req, res) => {
+  const { sport } = req.params;
+  if (!SPORTS[sport]) return res.status(400).json({ error: "Invalid sport" });
+  const cacheKey = `allplayers_${sport}`;
+  const cached = caches.freeagents.get(cacheKey);
+  if (cached) return res.json({ players: cached, fromCache: true, count: cached.length });
+  try {
+    const players = await getFreeAgents(sport, null);
+    // Sort by last name
+    players.sort((a, b) => {
+      const aLast = (a.name || '').split(' ').pop();
+      const bLast = (b.name || '').split(' ').pop();
+      return aLast.localeCompare(bLast);
+    });
+    caches.freeagents.set(cacheKey, players);
+    res.json({ players, fromCache: false, count: players.length });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/freeagents/:sport", async (req, res) => {
   const { sport } = req.params;
   const { position, search } = req.query;
