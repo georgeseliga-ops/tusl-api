@@ -1481,6 +1481,19 @@ app.post("/api/draft/:sport/close-nomination", authRequired, async (req, res) =>
 });
 
 // Reset draft session
+// Force-fix nomination order (commissioner only)
+app.post("/api/draft/:sport/fix-order", authRequired, commissionerRequired, async (req, res) => {
+  const { sport } = req.params;
+  const order = [9,1,2,3,4,5,6,7,8,10];
+  try {
+    await pool.query(
+      "UPDATE draft_sessions SET nomination_order=$1, current_nominator_idx=0 WHERE sport=$2 AND status IN ('waiting','active')",
+      [JSON.stringify(order), sport]
+    );
+    res.json({ success: true, order });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/api/draft/:sport/reset", authRequired, async (req, res) => {
   const { sport } = req.params;
   try {
