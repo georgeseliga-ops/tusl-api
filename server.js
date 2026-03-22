@@ -1497,23 +1497,24 @@ app.post("/api/draft/:sport/fix-order", authRequired, commissionerRequired, asyn
 app.post("/api/draft/:sport/reset", authRequired, async (req, res) => {
   const { sport } = req.params;
   try {
-    const session = await pool.query(
-      "SELECT id FROM draft_sessions WHERE sport = $1 ORDER BY created_at DESC LIMIT 1", [sport]
+    // Get ALL sessions for this sport
+    const sessions = await pool.query(
+      "SELECT id FROM draft_sessions WHERE sport = $1", [sport]
     );
-    if (session.rows.length > 0) {
-      const sid = session.rows[0].id;
+    for (const row of sessions.rows) {
+      const sid = row.id;
       await pool.query("DELETE FROM draft_bids WHERE session_id = $1", [sid]);
       await pool.query("DELETE FROM draft_nominations WHERE session_id = $1", [sid]);
       await pool.query("DELETE FROM draft_results WHERE session_id = $1", [sid]);
       await pool.query("DELETE FROM draft_sessions WHERE id = $1", [sid]);
     }
-    // Create fresh session with George's Giants (9) nominating first
+    // Create fresh session with George's Giants (9) first
     const order = [9,1,2,3,4,5,6,7,8,10];
     await pool.query(
       "INSERT INTO draft_sessions (sport, status, nomination_order, commissioner_team_id) VALUES ($1, 'waiting', $2, 9)",
       [sport, JSON.stringify(order)]
     );
-    res.json({ success: true });
+    res.json({ success: true, order });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
