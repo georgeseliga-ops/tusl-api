@@ -1494,10 +1494,10 @@ app.post("/api/draft/:sport/reset", authRequired, async (req, res) => {
       await pool.query("DELETE FROM draft_results WHERE session_id = $1", [sid]);
       await pool.query("DELETE FROM draft_sessions WHERE id = $1", [sid]);
     }
-    // Create fresh session
-    const order = [1,2,3,4,5,6,7,8,9,10];
+    // Create fresh session with George's Giants (9) nominating first
+    const order = [9,1,2,3,4,5,6,7,8,10];
     await pool.query(
-      "INSERT INTO draft_sessions (sport, status, nomination_order) VALUES ($1, 'waiting', $2)",
+      "INSERT INTO draft_sessions (sport, status, nomination_order, commissioner_team_id) VALUES ($1, 'waiting', $2, 9)",
       [sport, JSON.stringify(order)]
     );
     res.json({ success: true });
